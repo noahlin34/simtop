@@ -3,10 +3,10 @@ name = "simtop"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance iOS Simulator management TUI and automation CLI"
+license = "MIT"
+repository = "https://github.com/noahlin34/simtop"
 # Floor set by the dependency with the highest MSRV (ratatui 0.29, clap 4.5:
-# Rust 1.74); the source itself only needs 1.70 (is_some_and). Repository,
-# homepage, and license are intentionally absent: the project has not
-# published them yet, and placeholders would be fabricated metadata.
+# Rust 1.74); the source itself only needs 1.70 (is_some_and).
 rust-version = "1.74"
 
 [profile.release]
