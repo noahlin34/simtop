@@ -1,0 +1,168 @@
+# Release workflow: builds a universal (arm64 + x86_64) macOS `simtop` binary
+# from the tagged source and drafts a GitHub release with the archive.
+#
+# The artifact is intentionally NOT codesigned: signing requires a Developer
+# ID certificate and notarization secrets that this repository does not have
+# (and must not pretend to have). The output is a plain universal Mach-O —
+# "signed-ready" — that can be ad-hoc re-signed for local use or submitted to
+# notarization later with real credentials. Do not add a codesign step that
+# runs without secrets; such a step would only fail or silently no-op.
+#
+# Tags must look like `v<semver>` (e.g. `v0.1.0`). The tag is also the
+# source archive that the Homebrew formula (Formula/simtop.rb) builds from,
+# so this workflow additionally publishes that archive's SHA-256 for the
+# formula's `sha256`. Manual runs must supply the `version` input: there is
+# no pushed tag to derive it from.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without leading "v" (e.g. 0.1.0); required for manual runs (tag pushes derive it from the tag).'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build simtop (${{ matrix.target }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # stable always satisfies the crate's rust-version (1.74), so no MSRV
+      # pin is needed; each target is installed for the cross-arch build.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Cross-compiling x86_64 from the arm64 runner needs no Rosetta; the
+      # build script compiles the Objective-C bridge for the target arch.
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Upload per-arch binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: simtop-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/simtop
+          if-no-files-found: error
+
+  package:
+    name: Package universal archive
+    needs: build
+    runs-on: macos-15
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [[ -z "$VERSION" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then
+              echo "::error::workflow_dispatch requires the 'version' input; there is no pushed tag to derive it from."
+              exit 1
+            fi
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version must be a semantic version without a leading 'v' (got \"$VERSION\")."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download per-arch binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Each artifact lands in dist/<artifact-name>/ so the two `simtop`
+          # binaries do not collide.
+          merge-multiple: false
+
+      - name: Lipo-merge universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            dist/simtop-aarch64-apple-darwin/simtop \
+            dist/simtop-x86_64-apple-darwin/simtop \
+            -output universal/simtop
+
+      - name: Verify universal binary
+        run: |
+          file universal/simtop
+          lipo -info universal/simtop
+
+      - name: Smoke-test native slice
+        run: |
+          # --version is served before any CoreSimulator/Xcode requirement,
+          # so this runs on the arm64 slice of the universal binary.
+          ./universal/simtop --version
+
+      - name: Stage and compress archive
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STAGE="simtop-${VERSION}-darwin-universal"
+          mkdir -p "${STAGE}/bin"
+          cp universal/simtop "${STAGE}/bin/simtop"
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Compute source-archive checksum for the formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SOURCE_URL="https://github.com/${GITHUB_REPOSITORY_OWNER}/simtop/archive/refs/tags/v${VERSION}.tar.gz"
+          if curl -fsSL --retry 3 --retry-delay 2 -o "simtop-${VERSION}-source.tar.gz" "$SOURCE_URL"; then
+            shasum -a 256 "simtop-${VERSION}-source.tar.gz" > "simtop-${VERSION}-source.tar.gz.sha256"
+          else
+            echo "::warning::Could not fetch the v${VERSION} source archive (not tagged yet, or repository not public); the formula's sha256 must then be computed manually."
+          fi
+
+      - name: Upload universal archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: simtop-darwin-universal
+          path: |
+            simtop-*.tar.gz
+            simtop-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download universal archive
+        uses: actions/download-artifact@v4
+        with:
+          name: simtop-darwin-universal
+          path: dist
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          generate_release_notes: true
