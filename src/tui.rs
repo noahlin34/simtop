@@ -858,9 +858,13 @@ impl App {
             }
             return;
         }
-        // Any key other than 'd' cancels a pending delete confirmation.
-        if self.confirm_delete.is_some() && key.code != KeyCode::Char('d') {
-            self.confirm_delete = None;
+        // A pending delete is confirmed only by an explicit y/Y. Every other
+        // key means no; Enter therefore keeps the safe default.
+        if let Some(udid) = self.confirm_delete.take() {
+            if delete_confirmation_accepts(key.code) {
+                self.spawn_action(Action::Delete { udid });
+            }
+            return;
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -897,8 +901,8 @@ impl App {
                     self.focus = Focus::List;
                 }
             }
-            KeyCode::Up => self.move_focus(1),
-            KeyCode::Down => self.move_focus(-1),
+            KeyCode::Up => self.move_focus(-1),
+            KeyCode::Down => self.move_focus(1),
             KeyCode::PageUp => self.page_focus(-10),
             KeyCode::PageDown => self.page_focus(10),
             KeyCode::Home => self.home_focus(),
@@ -1203,7 +1207,8 @@ impl App {
         }
     }
 
-    /// Destructive delete needs a second `d` press.
+    /// Destructive delete requires an explicit yes; every other response
+    /// cancels, including Enter.
     fn request_delete(&mut self) {
         let Some(device) = self.selected_device() else {
             self.push_activity(ActivityLine::warn("no device selected"));
@@ -1211,17 +1216,12 @@ impl App {
         };
         let udid = device.udid.clone();
         let name = device.name.clone();
-        if self.confirm_delete.as_deref() == Some(udid.as_str()) {
-            self.confirm_delete = None;
-            self.spawn_action(Action::Delete { udid });
-        } else {
-            self.confirm_delete = Some(udid.clone());
-            self.push_activity(ActivityLine::warn(format!(
-                "delete {} ({}): press d again to confirm",
-                name,
-                short_udid(&udid)
-            )));
-        }
+        self.confirm_delete = Some(udid.clone());
+        self.push_activity(ActivityLine::warn(format!(
+            "delete {} ({}): y/N",
+            name,
+            short_udid(&udid)
+        )));
     }
 
     fn adjust_interval(&mut self, faster: bool) {
@@ -1677,10 +1677,7 @@ impl App {
                 let message = if self.show_help {
                     "help open - press ? or q to close".to_string()
                 } else if let Some(udid) = &self.confirm_delete {
-                    format!(
-                        "delete {}: press d again to confirm, any other key cancels",
-                        short_udid(udid)
-                    )
+                    format!("delete {}: y/N (Enter = no)", short_udid(udid))
                 } else if self.focus == Focus::Logs {
                     "[PgUp/PgDn/j/k] scroll logs  [Tab] focus devices  [q] quit".to_string()
                 } else {
@@ -1824,7 +1821,7 @@ const HELP: &[(&str, &str)] = &[
     ("i", "install app (path prompt)"),
     ("a / t / u", "launch / terminate / uninstall app"),
     ("w", "open URL in device"),
-    ("d", "delete device (press twice)"),
+    ("d", "delete device (y/N confirmation)"),
     ("r", "refresh now"),
     ("/", "search and filter devices"),
     ("f", "cycle state filter: all/booted/shutdown"),
@@ -1987,4 +1984,22 @@ fn screenshot_default_path(udid: &str) -> String {
         short_udid(udid),
         utc_stamp_compact()
     )
+}
+
+fn delete_confirmation_accepts(key: KeyCode) -> bool {
+    matches!(key, KeyCode::Char('y') | KeyCode::Char('Y'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_confirmation_defaults_to_no() {
+        assert!(delete_confirmation_accepts(KeyCode::Char('y')));
+        assert!(delete_confirmation_accepts(KeyCode::Char('Y')));
+        assert!(!delete_confirmation_accepts(KeyCode::Char('n')));
+        assert!(!delete_confirmation_accepts(KeyCode::Char('N')));
+        assert!(!delete_confirmation_accepts(KeyCode::Enter));
+    }
 }
