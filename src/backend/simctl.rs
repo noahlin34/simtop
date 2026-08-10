@@ -391,19 +391,16 @@ fn parse_log_entries(stdout: &str) -> Result<Vec<LogEntry>, SimtopError> {
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(serde_json::Value::Array(arr)) => {
-            for v in &arr {
-                if let Some(e) = log_entry_from_value(v) {
-                    entries.push(e);
-                }
+    if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        for v in &arr {
+            if let Some(e) = log_entry_from_value(v) {
+                entries.push(e);
             }
-            return Ok(entries);
         }
-        // Non-array JSON (or a parse error): fall through to the
-        // line-delimited shape.
-        _ => {}
+        return Ok(entries);
     }
+    // Non-array JSON (or a parse error): fall through to the
+    // line-delimited shape.
     let mut saw_object = false;
     for line in trimmed.lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
