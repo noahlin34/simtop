@@ -1,20 +1,24 @@
 //! Interactive terminal UI for `simtop`.
 //!
-//! An event-driven, keyboard-only monitoring interface over the shared
-//! [`SimulatorBackend`] contract:
+//! A two-view, event-driven, keyboard-only interface over the shared
+//! [`SimulatorBackend`] contract. The persistent tabs expose simulator
+//! monitoring and project build/run in one terminal session:
 //!
-//! * **Event-driven refresh** — snapshots are polled on a configurable
-//!   interval (default 2s) with no high-frequency redraw loop. Backend calls
-//!   are spawned as Tokio tasks and their results are marshalled back over a
+//! * **Simulators** — snapshots are polled on a configurable interval
+//!   (default 2s) with no high-frequency redraw loop. Backend calls are
+//!   spawned as Tokio tasks and their results are marshalled back over a
 //!   bounded channel; refresh/log requests are coalesced with in-flight flags
 //!   so at most one of each is outstanding. The screen is redrawn only when
 //!   input arrives, state actually changes, or a refresh changed the data.
-//! * **Navigation & actions** — device list with selection, searchable
-//!   filtering (`/` plus a state filter), and capability-aware actions: the
-//!   action set is derived from the selected device's state and availability,
-//!   so boot/shutdown/open/screenshot/logs/app operations are only offered
-//!   when they can succeed. Every operation result (including errors) is
-//!   appended to a bounded activity history.
+//! * **Projects** — project discovery, configuration, build, and run controls
+//!   are handled by the sibling [`super::projects`] view without leaving the
+//!   session or changing the public TUI API.
+//! * **Navigation & actions** — the simulator device list supports selection,
+//!   searchable filtering (`/` plus a state filter), and capability-aware
+//!   actions: the action set is derived from the selected device's state and
+//!   availability, so boot/shutdown/open/screenshot/logs/app operations are
+//!   only offered when they can succeed. Every operation result (including
+//!   errors) is appended to a bounded activity history.
 //! * **Bounded history** — event channel capacity, activity history, and the
 //!   followed device-log buffer are all capped; nothing grows unboundedly.
 //! * **Terminal hygiene** — raw mode + alternate screen are entered once and
@@ -22,8 +26,12 @@
 //!   chained panic hook). Small terminals degrade to a reduced layout or an
 //!   explicit "too small" notice instead of rendering garbage.
 //!
-//! Entry points: [`run`] and [`run_with`]. Both consume the backend, manage
-//! their own terminal setup, and must be called from within a Tokio runtime.
+//! The shell APIs [`super::run`] and [`super::run_with`] start this shared
+//! session. Tab selection and terminal lifecycle remain in this module, and
+//! both public entry points must be called from within a Tokio runtime.
+
+use super::projects::ProjectsView;
+use super::TuiConfig;
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -60,9 +68,6 @@ const CHANNEL_CAPACITY: usize = 64;
 /// Smallest usable terminal; anything smaller gets a "too small" notice.
 const MIN_WIDTH: u16 = 52;
 const MIN_HEIGHT: u16 = 10;
-/// Default bounds for the activity and device-log histories.
-const DEFAULT_ACTIVITY_CAP: usize = 200;
-const DEFAULT_LOG_CAP: usize = 500;
 /// Refresh intervals reachable with `+` / `-` (seconds).
 const REFRESH_LADDER_SECS: [u64; 6] = [1, 2, 5, 10, 30, 60];
 
@@ -78,7 +83,6 @@ const AVAIL_W: u16 = 7;
 // Theme tokens: a single set of named styles so the whole UI stays coherent.
 // ---------------------------------------------------------------------------
 
-const TITLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
 const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const MUTED: Style = Style::new().fg(Color::DarkGray);
 const INFO: Style = Style::new().fg(Color::White);
@@ -94,41 +98,11 @@ const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 const DISABLED: Style = Style::new().fg(Color::DarkGray);
 
 // ---------------------------------------------------------------------------
-// Public configuration and entry points.
+// Session entry point.
 // ---------------------------------------------------------------------------
 
-/// Tunables for the TUI session.
-#[derive(Clone, Debug)]
-pub struct TuiConfig {
-    /// Interval between snapshot polls; adjustable at runtime with `+`/`-`.
-    pub refresh_interval: Duration,
-    /// Bounded activity (operation results/errors) history size.
-    pub activity_capacity: usize,
-    /// Bounded device-log buffer size shown in the log pane.
-    pub log_capacity: usize,
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        TuiConfig {
-            refresh_interval: Duration::from_secs(2),
-            activity_capacity: DEFAULT_ACTIVITY_CAP,
-            log_capacity: DEFAULT_LOG_CAP,
-        }
-    }
-}
-
-/// Run the TUI with default configuration until the user quits.
-///
-/// Consumes the backend, manages its own terminal setup (raw mode, alternate
-/// screen), and restores the terminal on every exit path including panics.
-/// Must be awaited inside a Tokio runtime.
-pub async fn run(backend: Box<dyn SimulatorBackend>) -> Result<(), SimtopError> {
-    run_with(backend, TuiConfig::default()).await
-}
-
-/// Run the TUI with a custom [`TuiConfig`]; see [`run`].
-pub async fn run_with(
+/// Start the two-view TUI session with custom configuration.
+pub(super) async fn start(
     backend: Box<dyn SimulatorBackend>,
     config: TuiConfig,
 ) -> Result<(), SimtopError> {
@@ -391,13 +365,19 @@ enum InputMode {
     },
 }
 
+/// Top-level content view selected by the persistent tabs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveView {
+    Simulators,
+    Projects,
+}
+
 /// Which pane receives navigation/scrolling keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     List,
     Logs,
 }
-
 /// State filter cycled with `f`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StateFilter {
@@ -494,6 +474,8 @@ struct LogLine {
 
 struct App {
     backend: Arc<dyn SimulatorBackend>,
+    projects: ProjectsView,
+    active_view: ActiveView,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     config: TuiConfig,
@@ -526,6 +508,30 @@ struct App {
     dirty: bool,
     quit: bool,
 }
+fn project_config_path(config: &TuiConfig) -> PathBuf {
+    config
+        .config_path
+        .clone()
+        .or_else(|| crate::config::Config::default_path().ok())
+        .unwrap_or_else(|| PathBuf::from("config.json"))
+}
+
+fn project_cache_root(config: &TuiConfig) -> PathBuf {
+    config.cache_root.clone().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Caches").join("simtop"))
+            .unwrap_or_else(|| PathBuf::from(".simtop-cache"))
+    })
+}
+
+fn project_launch_dir(config: &TuiConfig) -> PathBuf {
+    config
+        .launch_dir
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 impl App {
     fn new(backend: Box<dyn SimulatorBackend>, config: TuiConfig) -> Self {
@@ -535,8 +541,21 @@ impl App {
             log_capacity: config.log_capacity.max(1),
             ..config
         };
+        let backend: Arc<dyn SimulatorBackend> = Arc::from(backend);
+        let projects = ProjectsView::new(
+            Arc::clone(&backend),
+            config
+                .developer_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".")),
+            project_config_path(&config),
+            project_cache_root(&config),
+            project_launch_dir(&config),
+        );
         App {
-            backend: Arc::from(backend),
+            backend,
+            projects,
+            active_view: ActiveView::Simulators,
             tx,
             rx,
             config,
@@ -570,6 +589,7 @@ impl App {
     /// The main loop: drain channel events, poll keyboard, tick refresh,
     /// redraw only when something changed.
     async fn run(mut self, terminal: &mut Term) -> Result<(), SimtopError> {
+        self.projects.kickoff();
         self.spawn_refresh();
         loop {
             loop {
@@ -583,6 +603,10 @@ impl App {
                         ));
                     }
                 }
+            }
+            self.projects.tick();
+            if self.projects.take_dirty() {
+                self.dirty = true;
             }
             if self.quit {
                 break;
@@ -718,6 +742,7 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snapshot: DeviceSnapshot) {
+        self.projects.device_snapshot(snapshot.clone());
         let devices_changed = fingerprint(&self.devices) != fingerprint(&snapshot.devices);
         let meta_changed =
             snapshot.generation != self.generation || snapshot.timestamp != self.snapshot_time;
@@ -838,6 +863,43 @@ impl App {
     // -- key handling -------------------------------------------------------
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            self.dirty = true;
+            return;
+        }
+        if matches!(self.mode, InputMode::Normal) {
+            match key.code {
+                KeyCode::Char('1') => {
+                    self.active_view = ActiveView::Simulators;
+                    self.show_help = false;
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.active_view = ActiveView::Projects;
+                    self.show_help = false;
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.active_view == ActiveView::Projects {
+            if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+                self.quit = true;
+                self.dirty = true;
+                return;
+            }
+            if self.projects.handle_key(key) {
+                self.dirty = true;
+            }
+            return;
+        }
+        self.handle_simulator_key(key);
+    }
+
+    fn handle_simulator_key(&mut self, key: KeyEvent) {
         self.dirty = true;
         if matches!(self.mode, InputMode::Edit { .. }) {
             self.handle_edit_key(key);
@@ -1299,30 +1361,34 @@ impl App {
                 return;
             }
             let rects = compute_layout(area);
-            self.logs_visible = rects.logs.is_some();
             self.render_top(frame, rects.top);
-            self.render_list(frame, rects.list);
-            if let Some(rect) = rects.details {
-                self.render_details(frame, rect);
-            }
-            if let Some(rect) = rects.logs {
-                self.render_logs(frame, rect);
-            }
-            self.render_activity(frame, rects.activity);
-            self.render_status(frame, rects.status);
-            if self.show_help {
-                render_help(frame, area);
-            }
-            if let InputMode::Edit {
-                kind,
-                text: _,
-                cursor,
-            } = &self.mode
-            {
-                let prefix = kind.title().len() + 2; // "title: "
-                let x = rects.status.x + prefix as u16 + *cursor as u16;
-                let x = x.min(rects.status.x + rects.status.width.saturating_sub(1));
-                frame.set_cursor_position(Position::new(x, rects.status.y));
+            if self.active_view == ActiveView::Projects {
+                self.projects.render(frame, rects.project);
+            } else {
+                self.logs_visible = rects.logs.is_some();
+                self.render_list(frame, rects.list);
+                if let Some(rect) = rects.details {
+                    self.render_details(frame, rect);
+                }
+                if let Some(rect) = rects.logs {
+                    self.render_logs(frame, rect);
+                }
+                self.render_activity(frame, rects.activity);
+                self.render_status(frame, rects.status);
+                if self.show_help {
+                    render_help(frame, area);
+                }
+                if let InputMode::Edit {
+                    kind,
+                    text: _,
+                    cursor,
+                } = &self.mode
+                {
+                    let prefix = kind.title().len() + 2; // "title: "
+                    let x = rects.status.x + prefix as u16 + *cursor as u16;
+                    let x = x.min(rects.status.x + rects.status.width.saturating_sub(1));
+                    frame.set_cursor_position(Position::new(x, rects.status.y));
+                }
             }
         })?;
         Ok(())
@@ -1333,43 +1399,48 @@ impl App {
             Block::new().borders(Borders::BOTTOM).border_style(BORDER),
             area,
         );
-        let left = Line::from(vec![
-            Span::styled("simtop", TITLE),
-            Span::styled("  -  iOS simulator monitor", MUTED),
-        ]);
+        let simulator_style = if self.active_view == ActiveView::Simulators {
+            ACCENT
+        } else {
+            MUTED
+        };
+        let projects_style = if self.active_view == ActiveView::Projects {
+            ACCENT
+        } else {
+            MUTED
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[1 Simulators]", simulator_style),
+                Span::raw(" "),
+                Span::styled("[2 Projects]", projects_style),
+            ])),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        if area.height < 2 {
+            return;
+        }
         let follow = self
             .follow_udid
             .as_deref()
             .map(short_udid)
             .unwrap_or_else(|| "off".to_string());
         let meta = format!(
-            "gen {} | {} devices | refresh {}s | follow {} | as of {}",
+            "simtop | gen {} | {} devices | refresh {}s | follow {} | as of {}",
             self.generation,
             self.devices.len(),
             self.config.refresh_interval.as_secs(),
             follow,
             self.snapshot_time,
         );
-        let meta_width = meta.chars().count() as u16;
-        let left_width = if meta_width + 4 < area.width {
-            area.width - meta_width - 2
-        } else {
-            area.width
-        };
-        frame.render_widget(
-            Paragraph::new(left),
-            Rect::new(area.x, area.y, left_width, 1),
+        put(
+            frame.buffer_mut(),
+            area.x,
+            area.y + 1,
+            area.width,
+            &meta,
+            MUTED,
         );
-        if left_width < area.width {
-            put(
-                frame.buffer_mut(),
-                area.x + left_width + 2,
-                area.y,
-                area.width - left_width - 2,
-                &meta,
-                MUTED,
-            );
-        }
     }
 
     fn list_title(&self) -> String {
@@ -1705,6 +1776,7 @@ impl App {
 
 struct Rects {
     top: Rect,
+    project: Rect,
     list: Rect,
     details: Option<Rect>,
     logs: Option<Rect>,
@@ -1749,6 +1821,12 @@ fn compute_layout(area: Rect) -> Rects {
     };
     Rects {
         top: rows[0],
+        project: Rect::new(
+            main.x,
+            main.y,
+            main.width,
+            area.height.saturating_sub(main.y.saturating_sub(area.y)),
+        ),
         list,
         details,
         logs,
