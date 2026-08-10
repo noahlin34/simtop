@@ -43,7 +43,7 @@ fn device_state_serializes_to_snake_case_names() {
 #[test]
 fn device_state_unknown_serializes_as_tagged_raw_string() {
     assert_eq!(
-        serde_json::to_value(&DeviceState::Unknown("frobnicating".to_owned())).unwrap(),
+        serde_json::to_value(DeviceState::Unknown("frobnicating".to_owned())).unwrap(),
         json!({ "unknown": "frobnicating" })
     );
 }
@@ -115,7 +115,7 @@ fn unknown_state_round_trips_through_sim_device_json_without_loss() {
 
 #[test]
 fn sim_device_field_names_are_stable() {
-    let value = serde_json::to_value(&device()).unwrap();
+    let value = serde_json::to_value(device()).unwrap();
     assert_eq!(
         value,
         json!({
