@@ -149,7 +149,7 @@ pub struct Process {
 }
 
 /// Hardware capabilities of a simulator device.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DeviceCapabilities {
     /// Host architecture exposed to the device, e.g. "arm64" or "x86_64".
     pub arch: String,
@@ -158,16 +158,6 @@ pub struct DeviceCapabilities {
     /// GPU family as reported by CoreSimulator, when known.
     #[serde(default)]
     pub gpu: Option<String>,
-}
-
-impl Default for DeviceCapabilities {
-    fn default() -> Self {
-        DeviceCapabilities {
-            arch: String::new(),
-            is_64_bit: false,
-            gpu: None,
-        }
-    }
 }
 
 /// A point-in-time view of the simulator device set (schema v1).
