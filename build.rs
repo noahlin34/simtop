@@ -40,7 +40,7 @@ fn main() {
         // ...and relies on @try/@catch (NSException), which requires
         // Objective-C exception support.
         .flag("-fobjc-exceptions")
-        .flag(&format!("-mmacosx-version-min={min_version}"))
+        .flag(format!("-mmacosx-version-min={min_version}"))
         .compile("simtop_native");
 
     // The `cc` crate has no framework API (cc 1.x), so emit the link
