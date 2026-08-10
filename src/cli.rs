@@ -25,6 +25,7 @@
 //! code via [`SimtopError::exit_code`] (see `src/error.rs`); declining the
 //! exit with clap's standard code 2. `--json` never prompts.
 
+use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,6 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 
 use crate::backend::{connect, SimulatorBackend};
+use crate::config::Config;
 use crate::error::{ErrorCode, SimtopError};
 use crate::model::SimDevice;
 use crate::output::Output;
@@ -64,7 +66,7 @@ pub async fn run() -> ExitCode {
 /// Emit an error and return its deterministic exit code.
 fn report(out: &Output, cli: &Cli, err: SimtopError) -> ExitCode {
     let code = to_exit_code(err.exit_code());
-    if let Err(io_err) = out.error(&cli.command_name(), &err) {
+    if let Err(io_err) = out.error(cli.command_name(), &err) {
         eprintln!("simtop: failed to report error: {io_err}");
     }
     code
@@ -285,7 +287,6 @@ impl AppAction {
 async fn dispatch(cli: &Cli, out: &Output) -> Result<(), RunError> {
     let xcode = XcodeEnvironment::resolve(cli.developer_dir.as_deref())?;
     let backend = connect(xcode.developer_dir(), Duration::from_secs(cli.timeout))?;
-
     match &cli.command {
         None => {
             if cli.json || cli.no_input {
@@ -294,13 +295,40 @@ async fn dispatch(cli: &Cli, out: &Output) -> Result<(), RunError> {
                     "the interactive TUI cannot be combined with --json or --no-input",
                 )));
             }
-            crate::tui::run(backend).await.map_err(RunError::Failed)
+            let config = tui_config(xcode.developer_dir())?;
+            crate::tui::run_with(backend, config)
+                .await
+                .map_err(RunError::Failed)
         }
         Some(command) => {
             let backend: &dyn SimulatorBackend = &*backend;
             run_command(backend, out, command, cli.no_input).await
         }
     }
+}
+
+fn tui_config(developer_dir: &Path) -> Result<crate::tui::TuiConfig, RunError> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RunError::Failed(SimtopError::new(
+                ErrorCode::IoError,
+                "HOME is unavailable; cannot determine TUI runtime paths",
+            ))
+        })?;
+    let launch_dir = env::current_dir()?;
+    Ok(crate::tui::TuiConfig {
+        developer_dir: Some(developer_dir.to_path_buf()),
+        config_path: Some(Config::default_path()?),
+        cache_root: Some(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("simtop"),
+        ),
+        launch_dir: Some(launch_dir),
+        ..crate::tui::TuiConfig::default()
+    })
 }
 
 async fn run_command(
@@ -454,10 +482,8 @@ async fn cmd_delete(
     no_input: bool,
 ) -> Result<(), RunError> {
     let device = resolve_device(backend, selector).await?;
-    if !out.is_json() && !no_input && io::stdin().is_terminal() {
-        if !confirm_delete(&device) {
-            return Err(RunError::Aborted);
-        }
+    if !out.is_json() && !no_input && io::stdin().is_terminal() && !confirm_delete(&device) {
+        return Err(RunError::Aborted);
     }
     backend.delete(&device.udid).await?;
     out.udid_result(
@@ -617,7 +643,7 @@ mod tests {
 
     use crate::model::{DeviceLog, DeviceSnapshot, LaunchInfo};
 
-    /// Deterministic backend stub for dispatch tests.
+    /// Deterministic backend used by dispatch tests.
     struct FakeBackend {
         devices: Vec<SimDevice>,
     }
@@ -657,7 +683,7 @@ mod tests {
         ) -> Result<SimDevice, SimtopError> {
             Err(SimtopError::new(
                 ErrorCode::UnsupportedOperation,
-                "not stubbed",
+                "operation unavailable in test backend",
             ))
         }
         async fn delete(&self, _udid: &str) -> Result<(), SimtopError> {
@@ -669,7 +695,7 @@ mod tests {
         async fn launch(&self, _udid: &str, _bundle_id: &str) -> Result<LaunchInfo, SimtopError> {
             Err(SimtopError::new(
                 ErrorCode::UnsupportedOperation,
-                "not stubbed",
+                "operation unavailable in test backend",
             ))
         }
         async fn terminate(&self, _udid: &str, _bundle_id: &str) -> Result<(), SimtopError> {
