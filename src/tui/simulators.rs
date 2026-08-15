@@ -71,13 +71,14 @@ const MIN_HEIGHT: u16 = 10;
 /// Refresh intervals reachable with `+` / `-` (seconds).
 const REFRESH_LADDER_SECS: [u64; 6] = [1, 2, 5, 10, 30, 60];
 
-// List column widths (marker + state + name are always present).
+// List column widths. Secondary metadata yields space to the device name.
 const MARKER_W: u16 = 2;
 const STATE_W: u16 = 14; // "shutting down" (13) + padding
 const UDID_W: u16 = 37; // 36-char UUID + padding
 const RT_W: u16 = 12; // "iOS-18-0" + padding
 const OS_W: u16 = 9;
 const AVAIL_W: u16 = 7;
+const MIN_NAME_W: u16 = 26; // Keep common names readable before showing metadata.
 
 // ---------------------------------------------------------------------------
 // Theme tokens: a single set of named styles so the whole UI stays coherent.
@@ -1465,18 +1466,12 @@ impl App {
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
         let body = pane_head(frame, area, &self.list_title(), self.focus == Focus::List);
         let width = body.width;
-        let show_udid = width >= 58;
-        let show_rt = width >= 74;
-        let show_os = width >= 90;
-        let show_avail = width >= 104;
-
-        let fixed = MARKER_W
-            + STATE_W
-            + if show_udid { UDID_W } else { 0 }
-            + if show_rt { RT_W } else { 0 }
-            + if show_os { OS_W } else { 0 }
-            + if show_avail { AVAIL_W } else { 0 };
-        let name_width = width.saturating_sub(fixed).max(4);
+        let columns = list_columns(width);
+        let name_width = columns.name_width;
+        let show_udid = columns.show_udid;
+        let show_rt = columns.show_rt;
+        let show_os = columns.show_os;
+        let show_avail = columns.show_avail;
 
         let mut col = body.x + MARKER_W;
         let state_x = col;
@@ -1773,6 +1768,40 @@ impl App {
 // ---------------------------------------------------------------------------
 // Layout helpers.
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListColumns {
+    name_width: u16,
+    show_udid: bool,
+    show_rt: bool,
+    show_os: bool,
+    show_avail: bool,
+}
+
+/// Add secondary columns only when the name keeps a useful reading width.
+fn list_columns(width: u16) -> ListColumns {
+    let mut fixed = MARKER_W + STATE_W;
+    let mut add_column = |column_width| {
+        if width.saturating_sub(fixed) >= MIN_NAME_W + column_width {
+            fixed += column_width;
+            true
+        } else {
+            false
+        }
+    };
+    let show_udid = add_column(UDID_W);
+    let show_rt = show_udid && add_column(RT_W);
+    let show_os = show_rt && add_column(OS_W);
+    let show_avail = show_os && add_column(AVAIL_W);
+
+    ListColumns {
+        name_width: width.saturating_sub(fixed).max(4),
+        show_udid,
+        show_rt,
+        show_os,
+        show_avail,
+    }
+}
 
 struct Rects {
     top: Rect,
@@ -2079,5 +2108,23 @@ mod tests {
         assert!(!delete_confirmation_accepts(KeyCode::Char('n')));
         assert!(!delete_confirmation_accepts(KeyCode::Char('N')));
         assert!(!delete_confirmation_accepts(KeyCode::Enter));
+    }
+    #[test]
+    fn list_columns_protect_device_names_from_metadata() {
+        let narrow = list_columns(72);
+        assert!(!narrow.show_udid);
+        assert_eq!(narrow.name_width, 56);
+
+        let with_udid = list_columns(79);
+        assert!(with_udid.show_udid);
+        assert!(!with_udid.show_rt);
+        assert_eq!(with_udid.name_width, MIN_NAME_W);
+
+        let wide = list_columns(107);
+        assert!(wide.show_udid);
+        assert!(wide.show_rt);
+        assert!(wide.show_os);
+        assert!(wide.show_avail);
+        assert_eq!(wide.name_width, MIN_NAME_W);
     }
 }
