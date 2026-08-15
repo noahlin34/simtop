@@ -330,6 +330,13 @@ fn enabled_actions(device: &SimDevice) -> Vec<ActionKind> {
     actions.push(ActionKind::Delete);
     actions
 }
+/// Actions shown in the details pane, ordered consistently with the key map.
+fn available_actions(device: &SimDevice) -> impl Iterator<Item = ActionKind> {
+    let enabled = enabled_actions(device);
+    ACTION_ORDER
+        .into_iter()
+        .filter(move |kind| enabled.contains(kind))
+}
 
 /// Input modes: normal navigation, or a single-line edit for search/prompts.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1653,20 +1660,12 @@ impl App {
                     ),
                 ]));
                 lines.push(Line::raw(""));
-                lines.push(Line::styled("actions (enabled for current state)", LABEL));
-                for kind in ACTION_ORDER {
-                    let enabled = enabled_actions(device).contains(&kind);
+                lines.push(Line::styled("actions (available now)", LABEL));
+                for kind in available_actions(device) {
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            if enabled {
-                                format!("[{}]", kind.key())
-                            } else {
-                                "   ".to_string()
-                            },
-                            if enabled { ACCENT } else { DISABLED },
-                        ),
+                        Span::styled(format!("[{}]", kind.key()), ACCENT),
                         Span::raw(" "),
-                        Span::styled(kind.label(), if enabled { INFO } else { DISABLED }),
+                        Span::styled(kind.label(), INFO),
                     ]));
                 }
                 lines.push(Line::raw(""));
@@ -2126,5 +2125,29 @@ mod tests {
         assert!(wide.show_os);
         assert!(wide.show_avail);
         assert_eq!(wide.name_width, MIN_NAME_W);
+    }
+    #[test]
+    fn available_actions_only_lists_keyable_actions() {
+        let shutdown_keys: String = available_actions(&test_device(DeviceState::Shutdown))
+            .map(ActionKind::key)
+            .collect();
+        assert_eq!(shutdown_keys, "bod");
+
+        let booted_keys: String = available_actions(&test_device(DeviceState::Booted))
+            .map(ActionKind::key)
+            .collect();
+        assert_eq!(booted_keys, "ospliatuwd");
+    }
+
+    fn test_device(state: DeviceState) -> SimDevice {
+        SimDevice {
+            udid: "test-udid".to_string(),
+            name: "Test Device".to_string(),
+            state,
+            device_type: "test-type".to_string(),
+            runtime: "test-runtime".to_string(),
+            os_version: "1.0".to_string(),
+            is_available: true,
+        }
     }
 }
