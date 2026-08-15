@@ -34,8 +34,9 @@ use super::projects::ProjectsView;
 use super::TuiConfig;
 
 use std::collections::VecDeque;
+use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +56,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use tokio::sync::mpsc;
+
+use serde::{Deserialize, Serialize};
 
 use crate::backend::SimulatorBackend;
 use crate::error::{ErrorCode, SimtopError};
@@ -79,6 +82,74 @@ const RT_W: u16 = 12; // "iOS-18-0" + padding
 const OS_W: u16 = 9;
 const AVAIL_W: u16 = 7;
 const MIN_NAME_W: u16 = 26; // Keep common names readable before showing metadata.
+const DISPLAY_PREFERENCES_FILE: &str = "display-preferences.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct DisplayPreferences {
+    show_udid: bool,
+    show_device_type: bool,
+    show_runtime: bool,
+}
+
+impl Default for DisplayPreferences {
+    fn default() -> Self {
+        Self {
+            show_udid: false,
+            show_device_type: false,
+            show_runtime: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayPreference {
+    Udid,
+    DeviceType,
+    Runtime,
+}
+
+const DISPLAY_PREFERENCE_ORDER: [DisplayPreference; 3] = [
+    DisplayPreference::Udid,
+    DisplayPreference::DeviceType,
+    DisplayPreference::Runtime,
+];
+
+impl DisplayPreference {
+    fn key(self) -> char {
+        match self {
+            DisplayPreference::Udid => 'u',
+            DisplayPreference::DeviceType => 't',
+            DisplayPreference::Runtime => 'r',
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DisplayPreference::Udid => "UUID / UDID",
+            DisplayPreference::DeviceType => "device type",
+            DisplayPreference::Runtime => "runtime",
+        }
+    }
+
+    fn is_enabled(self, preferences: &DisplayPreferences) -> bool {
+        match self {
+            DisplayPreference::Udid => preferences.show_udid,
+            DisplayPreference::DeviceType => preferences.show_device_type,
+            DisplayPreference::Runtime => preferences.show_runtime,
+        }
+    }
+
+    fn toggle(self, preferences: &mut DisplayPreferences) {
+        match self {
+            DisplayPreference::Udid => preferences.show_udid = !preferences.show_udid,
+            DisplayPreference::DeviceType => {
+                preferences.show_device_type = !preferences.show_device_type
+            }
+            DisplayPreference::Runtime => preferences.show_runtime = !preferences.show_runtime,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Theme tokens: a single set of named styles so the whole UI stays coherent.
@@ -109,7 +180,10 @@ pub(super) async fn start(
 ) -> Result<(), SimtopError> {
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = App::new(backend, config).run(&mut terminal).await;
+    let result = match App::new(backend, config) {
+        Ok(app) => app.run(&mut terminal).await,
+        Err(error) => Err(error),
+    };
     restore_terminal();
     result
 }
@@ -512,7 +586,10 @@ struct App {
     mode: InputMode,
     focus: Focus,
     confirm_delete: Option<String>,
+    display_preferences: DisplayPreferences,
+    display_preferences_path: PathBuf,
     show_help: bool,
+    show_preferences: bool,
     dirty: bool,
     quit: bool,
 }
@@ -522,6 +599,67 @@ fn project_config_path(config: &TuiConfig) -> PathBuf {
         .clone()
         .or_else(|| crate::config::Config::default_path().ok())
         .unwrap_or_else(|| PathBuf::from("config.json"))
+}
+fn display_preferences_path(config: &TuiConfig) -> PathBuf {
+    project_config_path(config).with_file_name(DISPLAY_PREFERENCES_FILE)
+}
+
+impl DisplayPreferences {
+    fn load(path: &Path) -> Result<Self, SimtopError> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => {
+                return Err(SimtopError::with_source(
+                    ErrorCode::IoError,
+                    format!("failed to read display preferences {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        serde_json::from_slice(&bytes).map_err(|error| {
+            SimtopError::with_source(
+                ErrorCode::ParseError,
+                format!("failed to parse display preferences {}", path.display()),
+                error,
+            )
+        })
+    }
+
+    fn save(&self, path: &Path) -> Result<(), SimtopError> {
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|error| {
+            SimtopError::with_source(
+                ErrorCode::IoError,
+                format!(
+                    "failed to create display preferences directory {}",
+                    parent.display()
+                ),
+                error,
+            )
+        })?;
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, bytes).map_err(|error| {
+            SimtopError::with_source(
+                ErrorCode::IoError,
+                format!(
+                    "failed to write display preferences {}",
+                    temporary.display()
+                ),
+                error,
+            )
+        })?;
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(SimtopError::with_source(
+                ErrorCode::IoError,
+                format!("failed to replace display preferences {}", path.display()),
+                error,
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn project_cache_root(config: &TuiConfig) -> PathBuf {
@@ -542,13 +680,15 @@ fn project_launch_dir(config: &TuiConfig) -> PathBuf {
 }
 
 impl App {
-    fn new(backend: Box<dyn SimulatorBackend>, config: TuiConfig) -> Self {
+    fn new(backend: Box<dyn SimulatorBackend>, config: TuiConfig) -> Result<Self, SimtopError> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let config = TuiConfig {
             activity_capacity: config.activity_capacity.max(1),
             log_capacity: config.log_capacity.max(1),
             ..config
         };
+        let preferences_path = display_preferences_path(&config);
+        let display_preferences = DisplayPreferences::load(&preferences_path)?;
         let backend: Arc<dyn SimulatorBackend> = Arc::from(backend);
         let projects = ProjectsView::new(
             Arc::clone(&backend),
@@ -560,7 +700,7 @@ impl App {
             project_cache_root(&config),
             project_launch_dir(&config),
         );
-        App {
+        Ok(App {
             backend,
             projects,
             active_view: ActiveView::Simulators,
@@ -588,10 +728,13 @@ impl App {
             mode: InputMode::Normal,
             focus: Focus::List,
             confirm_delete: None,
+            display_preferences,
+            display_preferences_path: preferences_path,
             show_help: false,
+            show_preferences: false,
             dirty: true,
             quit: false,
-        }
+        })
     }
 
     /// The main loop: drain channel events, poll keyboard, tick refresh,
@@ -922,6 +1065,10 @@ impl App {
             }
             return;
         }
+        if self.show_preferences {
+            self.handle_preferences_key(key);
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if key.code == KeyCode::Char('c') {
                 self.quit = true;
@@ -939,6 +1086,10 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('v') => {
+                self.show_preferences = true;
+                self.show_help = false;
+            }
             KeyCode::Char('/') => self.start_edit(EditKind::Search, self.filter.clone()),
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 self.state_filter = self.state_filter.next();
@@ -978,6 +1129,29 @@ impl App {
             KeyCode::Home => self.home_focus(),
             KeyCode::End => self.end_focus(),
             _ => {}
+        }
+    }
+    fn handle_preferences_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('v') | KeyCode::Char('q') | KeyCode::Esc => {
+                self.show_preferences = false;
+            }
+            KeyCode::Char('u') => self.toggle_display_preference(DisplayPreference::Udid),
+            KeyCode::Char('t') => self.toggle_display_preference(DisplayPreference::DeviceType),
+            KeyCode::Char('r') => self.toggle_display_preference(DisplayPreference::Runtime),
+            _ => {}
+        }
+    }
+
+    fn toggle_display_preference(&mut self, preference: DisplayPreference) {
+        preference.toggle(&mut self.display_preferences);
+        if let Err(error) = self
+            .display_preferences
+            .save(&self.display_preferences_path)
+        {
+            self.push_activity(ActivityLine::err(format!(
+                "saving display preferences failed: {error}"
+            )));
         }
     }
 
@@ -1385,6 +1559,8 @@ impl App {
                 self.render_status(frame, rects.status);
                 if self.show_help {
                     render_help(frame, area);
+                } else if self.show_preferences {
+                    render_preferences(frame, area, &self.display_preferences);
                 }
                 if let InputMode::Edit {
                     kind,
@@ -1473,7 +1649,7 @@ impl App {
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
         let body = pane_head(frame, area, &self.list_title(), self.focus == Focus::List);
         let width = body.width;
-        let columns = list_columns(width);
+        let columns = list_columns(width, &self.display_preferences);
         let name_width = columns.name_width;
         let show_udid = columns.show_udid;
         let show_rt = columns.show_rt;
@@ -1620,12 +1796,13 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         match self.selected_device() {
             Some(device) => {
-                lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled("udid", LABEL),
-                    Span::raw("  "),
-                    Span::raw(device.udid.clone()),
-                ]));
+                if self.display_preferences.show_udid {
+                    lines.push(Line::from(vec![
+                        Span::styled("udid", LABEL),
+                        Span::raw("  "),
+                        Span::raw(device.udid.clone()),
+                    ]));
+                }
                 lines.push(Line::from(vec![
                     Span::styled("name", LABEL),
                     Span::raw("  "),
@@ -1636,16 +1813,20 @@ impl App {
                     Span::raw("  "),
                     Span::styled(device.state.to_string(), state_style(&device.state)),
                 ]));
-                lines.push(Line::from(vec![
-                    Span::styled("type", LABEL),
-                    Span::raw("  "),
-                    Span::raw(device.device_type.clone()),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("runtime", LABEL),
-                    Span::raw("  "),
-                    Span::raw(device.runtime.clone()),
-                ]));
+                if self.display_preferences.show_device_type {
+                    lines.push(Line::from(vec![
+                        Span::styled("type", LABEL),
+                        Span::raw("  "),
+                        Span::raw(device.device_type.clone()),
+                    ]));
+                }
+                if self.display_preferences.show_runtime {
+                    lines.push(Line::from(vec![
+                        Span::styled("runtime", LABEL),
+                        Span::raw("  "),
+                        Span::raw(device.runtime.clone()),
+                    ]));
+                }
                 lines.push(Line::from(vec![
                     Span::styled("os", LABEL),
                     Span::raw("  "),
@@ -1741,12 +1922,14 @@ impl App {
             InputMode::Normal => {
                 let message = if self.show_help {
                     "help open - press ? or q to close".to_string()
+                } else if self.show_preferences {
+                    "display preferences - u UUID  t type  r runtime  v/Esc close".to_string()
                 } else if let Some(udid) = &self.confirm_delete {
                     format!("delete {}: y/N (Enter = no)", short_udid(udid))
                 } else if self.focus == Focus::Logs {
                     "[PgUp/PgDn/j/k] scroll logs  [Tab] focus devices  [q] quit".to_string()
                 } else {
-                    "[up/down/j/k] select  [Enter] boot/open  [b] boot  [s] shutdown  [o] open  [/] search  [f] state filter  [l] logs  [d] delete  [r] refresh  [?] help  [q] quit".to_string()
+                    "[up/down/j/k] select  [Enter] boot/open  [b] boot  [s] shutdown  [o] open  [/] search  [f] state filter  [l] logs  [d] delete  [r] refresh  [v] display  [?] help  [q] quit".to_string()
                 };
                 let style = if self.confirm_delete.is_some() {
                     WARN
@@ -1778,7 +1961,7 @@ struct ListColumns {
 }
 
 /// Add secondary columns only when the name keeps a useful reading width.
-fn list_columns(width: u16) -> ListColumns {
+fn list_columns(width: u16, preferences: &DisplayPreferences) -> ListColumns {
     let mut fixed = MARKER_W + STATE_W;
     let mut add_column = |column_width| {
         if width.saturating_sub(fixed) >= MIN_NAME_W + column_width {
@@ -1788,9 +1971,9 @@ fn list_columns(width: u16) -> ListColumns {
             false
         }
     };
-    let show_udid = add_column(UDID_W);
-    let show_rt = show_udid && add_column(RT_W);
-    let show_os = show_rt && add_column(OS_W);
+    let show_udid = preferences.show_udid && add_column(UDID_W);
+    let show_rt = preferences.show_runtime && add_column(RT_W);
+    let show_os = add_column(OS_W);
     let show_avail = show_os && add_column(AVAIL_W);
 
     ListColumns {
@@ -1935,6 +2118,7 @@ const HELP: &[(&str, &str)] = &[
     ("Tab", "cycle focus: devices / logs"),
     ("PgUp / PgDn", "scroll focused pane"),
     ("Esc", "cancel prompt / clear search"),
+    ("v", "display preferences"),
     ("?", "toggle this help"),
 ];
 
@@ -1969,6 +2153,49 @@ fn render_help(frame: &mut Frame, area: Rect) {
             ])
         })
         .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+fn render_preferences(frame: &mut Frame, area: Rect, preferences: &DisplayPreferences) {
+    let width = 48u16.min(area.width.saturating_sub(4)).max(32);
+    let height = (DISPLAY_PREFERENCE_ORDER.len() as u16 + 4)
+        .min(area.height.saturating_sub(4))
+        .max(7);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::bordered()
+            .border_style(BORDER)
+            .title(Span::styled(" display preferences ", ACCENT)),
+        popup,
+    );
+    let inner = popup.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let mut lines = Vec::with_capacity(DISPLAY_PREFERENCE_ORDER.len() + 2);
+    lines.push(Line::styled(
+        "Optional metadata; saved automatically",
+        LABEL,
+    ));
+    for preference in DISPLAY_PREFERENCE_ORDER {
+        let enabled = preference.is_enabled(preferences);
+        lines.push(Line::from(vec![
+            Span::styled(
+                if enabled { "[x]" } else { "[ ]" },
+                if enabled { ACCENT } else { MUTED },
+            ),
+            Span::raw(" "),
+            Span::styled(format!("[{}]", preference.key()), ACCENT),
+            Span::raw(" "),
+            Span::styled(preference.label(), INFO),
+        ]));
+    }
+    lines.push(Line::styled("u/t/r toggle · v or Esc close", LABEL));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -2109,22 +2336,66 @@ mod tests {
         assert!(!delete_confirmation_accepts(KeyCode::Enter));
     }
     #[test]
-    fn list_columns_protect_device_names_from_metadata() {
-        let narrow = list_columns(72);
+    fn list_columns_hide_redundant_metadata_by_default() {
+        let defaults = DisplayPreferences::default();
+        let narrow = list_columns(50, &defaults);
         assert!(!narrow.show_udid);
-        assert_eq!(narrow.name_width, 56);
+        assert!(!narrow.show_rt);
+        assert!(!narrow.show_os);
+        assert!(!narrow.show_avail);
 
-        let with_udid = list_columns(79);
-        assert!(with_udid.show_udid);
-        assert!(!with_udid.show_rt);
-        assert_eq!(with_udid.name_width, MIN_NAME_W);
+        let default_wide = list_columns(79, &defaults);
+        assert!(!default_wide.show_udid);
+        assert!(!default_wide.show_rt);
+        assert!(default_wide.show_os);
+        assert!(default_wide.show_avail);
 
-        let wide = list_columns(107);
+        let with_identity = DisplayPreferences {
+            show_udid: true,
+            ..defaults
+        };
+        let identity = list_columns(79, &with_identity);
+        assert!(identity.show_udid);
+        assert!(!identity.show_rt);
+        assert!(!identity.show_os);
+        assert!(!identity.show_avail);
+        assert_eq!(identity.name_width, MIN_NAME_W);
+
+        let all_metadata = DisplayPreferences {
+            show_udid: true,
+            show_device_type: true,
+            show_runtime: true,
+        };
+        let wide = list_columns(107, &all_metadata);
         assert!(wide.show_udid);
         assert!(wide.show_rt);
         assert!(wide.show_os);
         assert!(wide.show_avail);
         assert_eq!(wide.name_width, MIN_NAME_W);
+    }
+
+    #[test]
+    fn display_preferences_round_trip() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simtop-display-preferences-{}-{timestamp}.json",
+            std::process::id()
+        ));
+        let expected = DisplayPreferences {
+            show_udid: true,
+            show_device_type: true,
+            show_runtime: false,
+        };
+
+        expected.save(&path).expect("preferences should save");
+        assert_eq!(
+            DisplayPreferences::load(&path).expect("preferences should load"),
+            expected
+        );
+        let _ = fs::remove_file(path);
     }
     #[test]
     fn available_actions_only_lists_keyable_actions() {
