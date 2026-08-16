@@ -4,8 +4,8 @@
 
 An interactive TUI and a one-shot automation CLI that share a single hybrid
 backend: a native Objective-C CoreSimulator bridge for the hot paths, with
-`simctl` as the fallback. Manage simulators without leaving the keyboard —
-or drive them from scripts and CI.
+`simctl` as the fallback. Manage simulators with first-class keyboard and
+mouse controls, or drive them from scripts and CI.
 
 ```
 ┌ simtop ───────────────────────────── gen 12 | 3 devices | refresh 2s ──┐
@@ -28,9 +28,9 @@ Illustrative mock — run `simtop` for the real thing.
 
 ## Features
 
-- **Interactive TUI** (ratatui): searchable device list, state filter, live
-  log pane, and capability-aware actions — a device only offers operations
-  that can succeed in its current state.
+- **Interactive TUI** (ratatui): clickable tabs, device rows, project setup,
+  action controls, and dialogs; wheel scrolling; searchable device list; state
+  filter; live logs; and capability-aware operations.
 - **One-shot CLI**: every TUI action exists as a subcommand, so the same
   backend drives interactive and scripted use.
 - **Hybrid engine**: device discovery and lifecycle (list, boot, shutdown,
