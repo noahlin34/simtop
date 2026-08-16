@@ -4,6 +4,10 @@
 
 `simtop` is a terminal UI (ratatui) for managing iOS simulators: listing, booting/shutting down, creating/deleting, installing/launching apps, screenshots, and logs. It ships two frontends on one backend — an interactive TUI and one-shot CLI subcommands (`simtop list`, `simtop boot <udid>`, ...). macOS-only (15+, Xcode 16); it drives Apple's `simctl` plus a dynamically-loaded Objective-C CoreSimulator bridge for the hot paths. JSON output mode is designed for scripting.
 
+The app has full mouse support for clicking and mouse usage in the TUI. THis is a needed feature, and the ability to have an equal 
+expereicne regardless of if it is the keyboard ofr mouse being used is mandatory non-negotiable. Mouse support is first class citizen, 
+as is keyboard user
+
 ## Architecture & Data Flow
 
 The binary is a thin shim; all logic lives in the library crate:
