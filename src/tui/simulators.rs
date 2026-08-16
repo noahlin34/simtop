@@ -1,7 +1,7 @@
 //! Interactive terminal UI for `simtop`.
 //!
-//! A two-view, event-driven, keyboard-only interface over the shared
-//! [`SimulatorBackend`] contract. The persistent tabs expose simulator
+//! A two-view, event-driven interface with first-class keyboard and mouse
+//! controls over the shared [`SimulatorBackend`] contract. The persistent tabs expose simulator
 //! monitoring and project build/run in one terminal session:
 //!
 //! * **Simulators** — snapshots are polled on a configurable interval
@@ -41,7 +41,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -167,7 +170,6 @@ const HEADER: Style = Style::new()
     .add_modifier(Modifier::BOLD);
 const BORDER: Style = Style::new().fg(Color::DarkGray);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
-const DISABLED: Style = Style::new().fg(Color::DarkGray);
 
 // ---------------------------------------------------------------------------
 // Session entry point.
@@ -196,7 +198,7 @@ pub(super) async fn start(
 fn init_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
         let _ = disable_raw_mode();
         return Err(error);
     }
@@ -213,7 +215,12 @@ fn init_terminal() -> io::Result<Term> {
 /// Best-effort restoration of the terminal; safe to call repeatedly.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 /// Chain a hook that restores the terminal if the UI panics mid-session.
@@ -460,6 +467,41 @@ enum Focus {
     List,
     Logs,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseTarget {
+    View(ActiveView),
+    Device(usize),
+    FocusLogs,
+    Action(ActionKind),
+    Refresh,
+    Search,
+    StateFilter,
+    ToggleLogs,
+    Preferences,
+    Help,
+    Quit,
+    CloseOverlay,
+    Preference(DisplayPreference),
+    ConfirmDelete(bool),
+    SubmitEdit,
+    CancelEdit,
+}
+
+#[derive(Clone, Copy)]
+struct HitRegion {
+    area: Rect,
+    target: MouseTarget,
+}
+
+impl HitRegion {
+    fn contains(self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && column < self.area.x.saturating_add(self.area.width)
+            && row >= self.area.y
+            && row < self.area.y.saturating_add(self.area.height)
+    }
+}
 /// State filter cycled with `f`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StateFilter {
@@ -590,6 +632,8 @@ struct App {
     display_preferences_path: PathBuf,
     show_help: bool,
     show_preferences: bool,
+    hit_regions: Vec<HitRegion>,
+    last_area: Rect,
     dirty: bool,
     quit: bool,
 }
@@ -732,6 +776,8 @@ impl App {
             display_preferences_path: preferences_path,
             show_help: false,
             show_preferences: false,
+            hit_regions: Vec::new(),
+            last_area: Rect::default(),
             dirty: true,
             quit: false,
         })
@@ -765,6 +811,7 @@ impl App {
             if event::poll(self.poll_duration()).map_err(SimtopError::from)? {
                 match event::read().map_err(SimtopError::from)? {
                     TermEvent::Key(key) => self.handle_key(key),
+                    TermEvent::Mouse(mouse) => self.handle_mouse(mouse),
                     TermEvent::Resize(_, _) => self.dirty = true,
                     _ => {}
                 }
@@ -1048,6 +1095,117 @@ impl App {
             return;
         }
         self.handle_simulator_key(key);
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.active_view == ActiveView::Projects {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            ) && self.projects.handle_mouse(mouse)
+            {
+                self.dirty = true;
+            }
+            if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+                return;
+            }
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.active_view != ActiveView::Simulators {
+                    return;
+                }
+                let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                };
+                let rects = compute_layout(self.last_area);
+                if rects
+                    .logs
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                {
+                    self.focus = Focus::Logs;
+                    self.scroll_logs(delta);
+                } else if rect_contains(rects.list, mouse.column, mouse.row) {
+                    self.focus = Focus::List;
+                    self.move_selection(delta);
+                }
+                self.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let target = self
+                    .hit_regions
+                    .iter()
+                    .rev()
+                    .find(|region| region.contains(mouse.column, mouse.row))
+                    .map(|region| region.target);
+                if let Some(target) = target {
+                    self.activate_mouse_target(target);
+                    self.dirty = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_mouse_target(&mut self, target: MouseTarget) {
+        match target {
+            MouseTarget::View(view) => {
+                self.active_view = view;
+                self.show_help = false;
+                self.show_preferences = false;
+            }
+            MouseTarget::Device(index) => {
+                if index < self.filtered.len() {
+                    self.selected = Some(index);
+                    let device_index = self.filtered[index];
+                    self.selected_udid = Some(self.devices[device_index].udid.clone());
+                    self.focus = Focus::List;
+                }
+            }
+            MouseTarget::FocusLogs => self.focus = Focus::Logs,
+            MouseTarget::Action(kind) => self.dispatch(kind),
+            MouseTarget::Refresh => self.spawn_refresh(),
+            MouseTarget::Search => self.start_edit(EditKind::Search, self.filter.clone()),
+            MouseTarget::StateFilter => {
+                self.state_filter = self.state_filter.next();
+                self.recompute_filter();
+            }
+            MouseTarget::ToggleLogs => self.toggle_logs(),
+            MouseTarget::Preferences => {
+                self.show_preferences = true;
+                self.show_help = false;
+            }
+            MouseTarget::Help => {
+                self.show_help = true;
+                self.show_preferences = false;
+            }
+            MouseTarget::Quit => self.quit = true,
+            MouseTarget::CloseOverlay => {
+                self.show_help = false;
+                self.show_preferences = false;
+            }
+            MouseTarget::Preference(preference) => self.toggle_display_preference(preference),
+            MouseTarget::ConfirmDelete(confirmed) => {
+                if let Some(udid) = self.confirm_delete.take() {
+                    if confirmed {
+                        self.spawn_action(Action::Delete { udid });
+                    }
+                }
+            }
+            MouseTarget::SubmitEdit => {
+                if let InputMode::Edit { kind, text, .. } = &self.mode {
+                    let kind = *kind;
+                    let text = text.clone();
+                    self.mode = InputMode::Normal;
+                    self.submit_edit(kind, text);
+                }
+            }
+            MouseTarget::CancelEdit => self.cancel_edit(),
+        }
     }
 
     fn handle_simulator_key(&mut self, key: KeyEvent) {
@@ -1538,6 +1696,7 @@ impl App {
     fn draw(&mut self, terminal: &mut Term) -> io::Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
+            self.last_area = area;
             if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
                 render_too_small(frame, area);
                 return;
@@ -1568,14 +1727,151 @@ impl App {
                     cursor,
                 } = &self.mode
                 {
-                    let prefix = kind.title().len() + 2; // "title: "
+                    let prefix = kind.title().len() + 2;
                     let x = rects.status.x + prefix as u16 + *cursor as u16;
                     let x = x.min(rects.status.x + rects.status.width.saturating_sub(1));
                     frame.set_cursor_position(Position::new(x, rects.status.y));
                 }
             }
         })?;
+        self.rebuild_hit_regions();
         Ok(())
+    }
+
+    fn rebuild_hit_regions(&mut self) {
+        self.hit_regions.clear();
+        let area = self.last_area;
+        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+            return;
+        }
+        self.hit_regions.push(HitRegion {
+            area: Rect::new(area.x, area.y, 14.min(area.width), 1),
+            target: MouseTarget::View(ActiveView::Simulators),
+        });
+        if area.width > 15 {
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(area.x + 15, area.y, 12.min(area.width - 15), 1),
+                target: MouseTarget::View(ActiveView::Projects),
+            });
+        }
+        if area.width >= 6 {
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(area.x + area.width - 6, area.y, 6, 1),
+                target: MouseTarget::Quit,
+            });
+        }
+        if self.active_view == ActiveView::Projects {
+            return;
+        }
+        let rects = compute_layout(area);
+        let list_body = pane_body(rects.list);
+        let first = self.list_scroll;
+        for row in 0..list_body.height {
+            let index = first + row as usize;
+            if index >= self.filtered.len() {
+                break;
+            }
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(list_body.x, list_body.y + row, list_body.width, 1),
+                target: MouseTarget::Device(index),
+            });
+        }
+        if let Some(logs) = rects.logs {
+            self.hit_regions.push(HitRegion {
+                area: logs,
+                target: MouseTarget::FocusLogs,
+            });
+        }
+        if let (Some(details), Some(device)) = (rects.details, self.selected_device()) {
+            let body = pane_body(details);
+            let optional_rows = usize::from(self.display_preferences.show_udid)
+                + usize::from(self.display_preferences.show_device_type)
+                + usize::from(self.display_preferences.show_runtime);
+            let first_action_y = body.y.saturating_add(6 + optional_rows as u16);
+            for (row, kind) in available_actions(device).enumerate() {
+                let y = first_action_y.saturating_add(row as u16);
+                if y >= body.y.saturating_add(body.height) {
+                    break;
+                }
+                self.hit_regions.push(HitRegion {
+                    area: Rect::new(body.x, y, body.width, 1),
+                    target: MouseTarget::Action(kind),
+                });
+            }
+        }
+        let mut x = if let InputMode::Edit { kind, text, .. } = &self.mode {
+            rects
+                .status
+                .x
+                .saturating_add((kind.title().chars().count() + text.chars().count() + 3) as u16)
+        } else {
+            rects.status.x
+        };
+        for (label, target) in self.mouse_controls() {
+            let width = label.chars().count() as u16;
+            if x >= rects.status.x.saturating_add(rects.status.width) {
+                break;
+            }
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(
+                    x,
+                    rects.status.y,
+                    width.min(rects.status.x + rects.status.width - x),
+                    1,
+                ),
+                target,
+            });
+            x = x.saturating_add(width + 1);
+        }
+        if self.show_help || self.show_preferences {
+            self.hit_regions.push(HitRegion {
+                area,
+                target: MouseTarget::CloseOverlay,
+            });
+        }
+        if self.show_preferences {
+            let popup = preferences_popup(area);
+            let inner = popup.inner(Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
+            for (row, preference) in DISPLAY_PREFERENCE_ORDER.iter().copied().enumerate() {
+                self.hit_regions.push(HitRegion {
+                    area: Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+                    target: MouseTarget::Preference(preference),
+                });
+            }
+        }
+    }
+
+    fn mouse_controls(&self) -> Vec<(String, MouseTarget)> {
+        if matches!(self.mode, InputMode::Edit { .. }) {
+            return vec![
+                ("[Submit]".into(), MouseTarget::SubmitEdit),
+                ("[Cancel]".into(), MouseTarget::CancelEdit),
+            ];
+        }
+        if self.show_help || self.show_preferences {
+            return vec![("[Close]".into(), MouseTarget::CloseOverlay)];
+        }
+        if self.confirm_delete.is_some() {
+            return vec![
+                ("[Yes, delete]".into(), MouseTarget::ConfirmDelete(true)),
+                ("[No]".into(), MouseTarget::ConfirmDelete(false)),
+            ];
+        }
+        vec![
+            ("[Refresh]".into(), MouseTarget::Refresh),
+            ("[Search]".into(), MouseTarget::Search),
+            (
+                format!("[Filter: {}]", self.state_filter.label()),
+                MouseTarget::StateFilter,
+            ),
+            ("[Logs]".into(), MouseTarget::ToggleLogs),
+            ("[Display]".into(), MouseTarget::Preferences),
+            ("[Help]".into(), MouseTarget::Help),
+            ("[Quit]".into(), MouseTarget::Quit),
+        ]
     }
 
     fn render_top(&self, frame: &mut Frame, area: Rect) {
@@ -1601,6 +1897,12 @@ impl App {
             ])),
             Rect::new(area.x, area.y, area.width, 1),
         );
+        if area.width >= 6 {
+            frame.render_widget(
+                Paragraph::new(Span::styled("[Quit]", ACCENT)),
+                Rect::new(area.x + area.width - 6, area.y, 6, 1),
+            );
+        }
         if area.height < 2 {
             return;
         }
@@ -1918,30 +2220,26 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let text: Line = match &self.mode {
-            InputMode::Normal => {
-                let message = if self.show_help {
-                    "help open - press ? or q to close".to_string()
-                } else if self.show_preferences {
-                    "display preferences - u UUID  t type  r runtime  v/Esc close".to_string()
-                } else if let Some(udid) = &self.confirm_delete {
-                    format!("delete {}: y/N (Enter = no)", short_udid(udid))
-                } else if self.focus == Focus::Logs {
-                    "[PgUp/PgDn/j/k] scroll logs  [Tab] focus devices  [q] quit".to_string()
-                } else {
-                    "[up/down/j/k] select  [Enter] boot/open  [b] boot  [s] shutdown  [o] open  [/] search  [f] state filter  [l] logs  [d] delete  [r] refresh  [v] display  [?] help  [q] quit".to_string()
-                };
-                let style = if self.confirm_delete.is_some() {
-                    WARN
-                } else {
-                    INFO
-                };
-                Line::from(Span::styled(message, style))
+        let controls = self.mouse_controls();
+        let control_spans = controls.iter().enumerate().flat_map(|(index, (label, _))| {
+            let mut spans = Vec::with_capacity(2);
+            if index > 0 {
+                spans.push(Span::raw(" "));
             }
-            InputMode::Edit { kind, text, .. } => Line::from(vec![
-                Span::styled(format!("{}: ", kind.title()), ACCENT),
-                Span::raw(text.clone()),
-            ]),
+            spans.push(Span::styled(label.clone(), ACCENT));
+            spans
+        });
+        let text = match &self.mode {
+            InputMode::Normal => Line::from(control_spans.collect::<Vec<_>>()),
+            InputMode::Edit { kind, text, .. } => {
+                let mut spans = vec![
+                    Span::styled(format!("{}: ", kind.title()), ACCENT),
+                    Span::raw(text.clone()),
+                    Span::raw(" "),
+                ];
+                spans.extend(control_spans);
+                Line::from(spans)
+            }
         };
         frame.render_widget(Paragraph::new(text), area);
     }
@@ -2066,6 +2364,21 @@ fn pane_head(frame: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect 
     inner[1]
 }
 
+fn pane_body(area: Rect) -> Rect {
+    if area.height < 3 {
+        area
+    } else {
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area)[1]
+    }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
 /// Single-cell text writer that truncates instead of wrapping.
 fn put(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
     if width == 0 {
@@ -2099,6 +2412,7 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
 }
 
 const HELP: &[(&str, &str)] = &[
+    ("Mouse", "click controls and rows; wheel scrolls"),
     ("q / Ctrl+C / Esc", "quit"),
     ("up/down or j/k", "select device"),
     ("g / G", "first / last device"),
@@ -2156,16 +2470,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 fn render_preferences(frame: &mut Frame, area: Rect, preferences: &DisplayPreferences) {
-    let width = 48u16.min(area.width.saturating_sub(4)).max(32);
-    let height = (DISPLAY_PREFERENCE_ORDER.len() as u16 + 4)
-        .min(area.height.saturating_sub(4))
-        .max(7);
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+    let popup = preferences_popup(area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::bordered()
@@ -2197,6 +2502,19 @@ fn render_preferences(frame: &mut Frame, area: Rect, preferences: &DisplayPrefer
     }
     lines.push(Line::styled("u/t/r toggle · v or Esc close", LABEL));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn preferences_popup(area: Rect) -> Rect {
+    let width = 48u16.min(area.width.saturating_sub(4)).max(32);
+    let height = (DISPLAY_PREFERENCE_ORDER.len() as u16 + 4)
+        .min(area.height.saturating_sub(4))
+        .max(7);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2408,6 +2726,18 @@ mod tests {
             .map(ActionKind::key)
             .collect();
         assert_eq!(booted_keys, "ospliatuwd");
+    }
+
+    #[test]
+    fn hit_regions_use_half_open_terminal_coordinates() {
+        let region = HitRegion {
+            area: Rect::new(10, 5, 4, 2),
+            target: MouseTarget::Refresh,
+        };
+        assert!(region.contains(10, 5));
+        assert!(region.contains(13, 6));
+        assert!(!region.contains(14, 5));
+        assert!(!region.contains(10, 7));
     }
 
     fn test_device(state: DeviceState) -> SimDevice {
