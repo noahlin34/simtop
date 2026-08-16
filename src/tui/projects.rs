@@ -5,7 +5,7 @@ use super::super::error::{ErrorCode, SimtopError};
 use super::super::model::{DeviceSnapshot, SimDevice};
 use super::super::project::{self, ProjectId, ProjectMetadata, XcodeContainer, XcodeProject};
 use super::super::run::{ProjectRunCoordinator, ProjectRunEvent, ProjectRunStage};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -93,6 +93,36 @@ impl Active {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseTarget {
+    Project(usize),
+    Focus(Focus),
+    Adjust(Focus, i32),
+    Filter,
+    AddRoot,
+    Rescan,
+    Build,
+    Run,
+    Cancel,
+    SubmitInput,
+    CancelInput,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HitRegion {
+    area: Rect,
+    target: MouseTarget,
+}
+
+impl HitRegion {
+    fn contains(self, mouse: MouseEvent) -> bool {
+        mouse.column >= self.area.x
+            && mouse.column < self.area.x.saturating_add(self.area.width)
+            && mouse.row >= self.area.y
+            && mouse.row < self.area.y.saturating_add(self.area.height)
+    }
+}
+
 pub(super) struct ProjectsView {
     backend: Arc<dyn SimulatorBackend>,
     developer_dir: PathBuf,
@@ -115,10 +145,13 @@ pub(super) struct ProjectsView {
     simulator: Option<String>,
     output: VecDeque<String>,
     output_bytes: usize,
+    output_scroll: usize,
     status: String,
     status_error: bool,
     operation: Option<String>,
     active: Option<Active>,
+    hit_regions: Vec<HitRegion>,
+    last_area: Rect,
     tx: mpsc::Sender<ProjectUiEvent>,
     rx: mpsc::Receiver<ProjectUiEvent>,
 }
@@ -154,10 +187,13 @@ impl ProjectsView {
             simulator: None,
             output: VecDeque::new(),
             output_bytes: 0,
+            output_scroll: 0,
             status: "Press r to rescan projects".into(),
             status_error: false,
             operation: None,
             active: None,
+            hit_regions: Vec::new(),
+            last_area: Rect::default(),
             tx,
             rx,
         }
@@ -316,9 +352,93 @@ impl ProjectsView {
         }
         true
     }
+
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(3)])
+                    .split(self.last_area);
+                let body = Layout::horizontal([
+                    Constraint::Percentage(29),
+                    Constraint::Percentage(39),
+                    Constraint::Percentage(32),
+                ])
+                .split(vertical[0]);
+                let delta: i32 = if mouse.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                };
+                if contains(body[2], mouse.column, mouse.row) {
+                    self.output_scroll = if delta < 0 {
+                        self.output_scroll
+                            .saturating_add(delta.unsigned_abs() as usize)
+                    } else {
+                        self.output_scroll.saturating_sub(delta as usize)
+                    };
+                } else if contains(body[0], mouse.column, mouse.row) {
+                    self.focus = Focus::Projects;
+                    self.move_sel(delta);
+                } else {
+                    return false;
+                }
+                self.dirty = true;
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let target = self
+                    .hit_regions
+                    .iter()
+                    .rev()
+                    .find(|region| region.contains(mouse))
+                    .map(|region| region.target);
+                if let Some(target) = target {
+                    self.activate_mouse_target(target);
+                    self.dirty = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn activate_mouse_target(&mut self, target: MouseTarget) {
+        match target {
+            MouseTarget::Project(index) => {
+                if index < self.rows.len() {
+                    self.selected = index;
+                    self.focus = Focus::Projects;
+                    self.restore();
+                    self.load_metadata();
+                }
+            }
+            MouseTarget::Focus(focus) => self.focus = focus,
+            MouseTarget::Adjust(focus, delta) => {
+                self.focus = focus;
+                self.adjust(delta);
+            }
+            MouseTarget::Filter => self.input = Input::Filter(String::new()),
+            MouseTarget::AddRoot => self.input = Input::Root(String::new()),
+            MouseTarget::Rescan if self.active.is_none() => self.rescan(),
+            MouseTarget::Build => self.start(false),
+            MouseTarget::Run if self.active.is_none() => self.start(true),
+            MouseTarget::Cancel => self.cancel(),
+            MouseTarget::SubmitInput => {
+                self.input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            MouseTarget::CancelInput => {
+                self.input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            MouseTarget::Rescan | MouseTarget::Run => {}
+        }
+    }
     pub(super) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.last_area = area;
         if area.width < 40 || area.height < 5 {
             frame.render_widget(Paragraph::new("terminal too small for Projects"), area);
+            self.hit_regions.clear();
             self.dirty = false;
             return;
         }
@@ -338,6 +458,7 @@ impl ProjectsView {
         self.setup(frame, body[1]);
         self.output(frame, body[2]);
         self.status(frame, vertical[1]);
+        self.rebuild_hit_regions(&body);
         self.dirty = false;
     }
     pub(super) fn take_dirty(&mut self) -> bool {
@@ -803,6 +924,7 @@ impl ProjectsView {
         }
         self.output_bytes += line.len();
         self.output.push_back(line);
+        self.output_scroll = 0;
         while self.output.len() > MAX_OUTPUT_LINES || self.output_bytes > MAX_OUTPUT_BYTES {
             if let Some(oldest) = self.output.pop_front() {
                 self.output_bytes = self.output_bytes.saturating_sub(oldest.len());
@@ -896,18 +1018,28 @@ impl ProjectsView {
             Focus::Configuration,
         );
         self.field(frame, rows[3], "Simulator", &simulator, Focus::Simulator);
+        let spans = self
+            .mouse_controls()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, (label, _))| {
+                let mut spans = Vec::with_capacity(2);
+                if index > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(label, ACCENT));
+                spans
+            })
+            .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                "1/2 switch views · ←/→ select · Tab focus · Enter load metadata · b build · R run · c cancel · a add root · / filter · r rescan",
-                MUTED,
-            ))
-            .wrap(Wrap { trim: true }),
+            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }),
             rows[4],
         );
     }
     fn field(&self, frame: &mut Frame, area: Rect, label: &str, value: &str, focus: Focus) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
+                Span::styled("[‹] ", ACCENT),
                 Span::styled(
                     format!("{label}: "),
                     if self.focus == focus { ACCENT } else { MUTED },
@@ -924,12 +1056,19 @@ impl ProjectsView {
             .wrap(Wrap { trim: true }),
             area,
         );
+        if area.width >= 3 {
+            frame.render_widget(
+                Paragraph::new(Span::styled("[›]", ACCENT)),
+                Rect::new(area.x + area.width - 3, area.y, 3, 1),
+            );
+        }
     }
     fn output(&self, frame: &mut Frame, area: Rect) {
         let lines = self
             .output
             .iter()
             .rev()
+            .skip(self.output_scroll)
             .take(area.height.saturating_sub(2) as usize)
             .rev()
             .map(|line| Line::from(line.as_str()))
@@ -945,6 +1084,98 @@ impl ProjectsView {
             area,
         );
     }
+    fn rebuild_hit_regions(&mut self, body: &[Rect]) {
+        self.hit_regions.clear();
+        let indices = self.indices();
+        let list_inner = Rect::new(
+            body[0].x.saturating_add(1),
+            body[0].y.saturating_add(1),
+            body[0].width.saturating_sub(2),
+            body[0].height.saturating_sub(2),
+        );
+        let visible = (list_inner.height / 2).max(1) as usize;
+        let selected_position = indices
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let first = selected_position.saturating_sub(visible.saturating_sub(1));
+        for (row, index) in indices.iter().skip(first).take(visible).enumerate() {
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(
+                    list_inner.x,
+                    list_inner.y + row as u16 * 2,
+                    list_inner.width,
+                    2.min(list_inner.height.saturating_sub(row as u16 * 2)),
+                ),
+                target: MouseTarget::Project(*index),
+            });
+        }
+        let setup_inner = Rect::new(
+            body[1].x.saturating_add(1),
+            body[1].y.saturating_add(1),
+            body[1].width.saturating_sub(2),
+            body[1].height.saturating_sub(2),
+        );
+        let rows = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(setup_inner);
+        for (area, focus) in [
+            (rows[0], Focus::Container),
+            (rows[1], Focus::Scheme),
+            (rows[2], Focus::Configuration),
+            (rows[3], Focus::Simulator),
+        ] {
+            self.hit_regions.push(HitRegion {
+                area,
+                target: MouseTarget::Focus(focus),
+            });
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(area.x, area.y, 3.min(area.width), 1),
+                target: MouseTarget::Adjust(focus, -1),
+            });
+            if area.width >= 3 {
+                self.hit_regions.push(HitRegion {
+                    area: Rect::new(area.x + area.width - 3, area.y, 3, 1),
+                    target: MouseTarget::Adjust(focus, 1),
+                });
+            }
+        }
+        let mut x = rows[4].x;
+        for (label, target) in self.mouse_controls() {
+            let width = label.chars().count() as u16;
+            if x >= rows[4].x.saturating_add(rows[4].width) {
+                break;
+            }
+            self.hit_regions.push(HitRegion {
+                area: Rect::new(x, rows[4].y, width.min(rows[4].x + rows[4].width - x), 1),
+                target,
+            });
+            x = x.saturating_add(width + 1);
+        }
+    }
+
+    fn mouse_controls(&self) -> Vec<(String, MouseTarget)> {
+        if !matches!(self.input, Input::Normal) {
+            return vec![
+                ("[Submit]".into(), MouseTarget::SubmitInput),
+                ("[Cancel]".into(), MouseTarget::CancelInput),
+            ];
+        }
+        vec![
+            ("[Build]".into(), MouseTarget::Build),
+            ("[Run]".into(), MouseTarget::Run),
+            ("[Cancel]".into(), MouseTarget::Cancel),
+            ("[Rescan]".into(), MouseTarget::Rescan),
+            ("[Add root]".into(), MouseTarget::AddRoot),
+            ("[Filter]".into(), MouseTarget::Filter),
+        ]
+    }
+
     fn status(&self, frame: &mut Frame, area: Rect) {
         let mut spans = vec![
             Span::styled(
@@ -960,5 +1191,26 @@ impl ProjectsView {
             Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::TOP)),
             area,
         );
+    }
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rectangle_contains_only_its_cells() {
+        let area = Rect::new(4, 7, 3, 2);
+        assert!(contains(area, 4, 7));
+        assert!(contains(area, 6, 8));
+        assert!(!contains(area, 7, 7));
+        assert!(!contains(area, 4, 9));
     }
 }
