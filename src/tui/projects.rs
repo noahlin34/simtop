@@ -26,6 +26,14 @@ const MUTED: Style = Style::new().fg(Color::DarkGray);
 const OK: Style = Style::new().fg(Color::Green);
 const ERR: Style = Style::new().fg(Color::Red);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
+const HOVER_BUTTON: Style = Style::new()
+    .fg(Color::Cyan)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::REVERSED);
+const HOVER_DANGER: Style = Style::new()
+    .fg(Color::Red)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::REVERSED);
 
 #[derive(Debug)]
 pub(super) enum ProjectUiEvent {
@@ -116,10 +124,14 @@ struct HitRegion {
 
 impl HitRegion {
     fn contains(self, mouse: MouseEvent) -> bool {
-        mouse.column >= self.area.x
-            && mouse.column < self.area.x.saturating_add(self.area.width)
-            && mouse.row >= self.area.y
-            && mouse.row < self.area.y.saturating_add(self.area.height)
+        self.contains_coords(mouse.column, mouse.row)
+    }
+
+    fn contains_coords(self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && column < self.area.x.saturating_add(self.area.width)
+            && row >= self.area.y
+            && row < self.area.y.saturating_add(self.area.height)
     }
 }
 
@@ -152,6 +164,7 @@ pub(super) struct ProjectsView {
     active: Option<Active>,
     hit_regions: Vec<HitRegion>,
     last_area: Rect,
+    cursor_pos: Option<(u16, u16)>,
     tx: mpsc::Sender<ProjectUiEvent>,
     rx: mpsc::Receiver<ProjectUiEvent>,
 }
@@ -194,10 +207,24 @@ impl ProjectsView {
             active: None,
             hit_regions: Vec::new(),
             last_area: Rect::default(),
+            cursor_pos: None,
             tx,
             rx,
         }
     }
+    fn hovered_target(&self) -> Option<MouseTarget> {
+        let (col, row) = self.cursor_pos?;
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|region| region.contains_coords(col, row))
+            .map(|region| region.target)
+    }
+
+    fn is_target_hovered(&self, target: MouseTarget) -> bool {
+        self.hovered_target() == Some(target)
+    }
+
     pub(super) fn kickoff(&mut self) {
         if self.started {
             return;
@@ -354,7 +381,13 @@ impl ProjectsView {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let new_cursor_pos = Some((mouse.column, mouse.row));
+        let cursor_moved = self.cursor_pos != new_cursor_pos;
+        self.cursor_pos = new_cursor_pos;
+
+        let handled = cursor_moved;
         match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => handled,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(3)])
                     .split(self.last_area);
@@ -380,7 +413,7 @@ impl ProjectsView {
                     self.focus = Focus::Projects;
                     self.move_sel(delta);
                 } else {
-                    return false;
+                    return handled;
                 }
                 self.dirty = true;
                 true
@@ -397,10 +430,10 @@ impl ProjectsView {
                     self.dirty = true;
                     true
                 } else {
-                    false
+                    handled
                 }
             }
-            _ => false,
+            _ => handled,
         }
     }
 
@@ -454,6 +487,9 @@ impl ProjectsView {
                 Constraint::Percentage(32),
             ])
             .split(vertical[0]);
+        if self.hit_regions.is_empty() {
+            self.rebuild_hit_regions(&body);
+        }
         self.project_list(frame, body[0]);
         self.setup(frame, body[1]);
         self.output(frame, body[2]);
@@ -939,7 +975,15 @@ impl ProjectsView {
             .iter()
             .map(|index| {
                 let row = &self.rows[*index];
-                let marker = if *index == self.selected { "›" } else { " " };
+                let selected = *index == self.selected;
+                let hovered = self.is_target_hovered(MouseTarget::Project(*index));
+                let marker = if selected {
+                    "›"
+                } else if hovered {
+                    "·"
+                } else {
+                    " "
+                };
                 let detail = if row.loading {
                     "  loading metadata…".to_string()
                 } else if let Some(error) = &row.error {
@@ -947,8 +991,16 @@ impl ProjectsView {
                 } else {
                     format!("  {}", row.project.directory.display())
                 };
+                let title_style = if hovered && !selected {
+                    Style::new().add_modifier(Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                };
                 ListItem::new(vec![
-                    Line::from(format!("{marker} {}", row.project.name)),
+                    Line::from(Span::styled(
+                        format!("{marker} {}", row.project.name),
+                        title_style,
+                    )),
                     Line::from(Span::styled(detail, MUTED)),
                 ])
             })
@@ -1022,12 +1074,22 @@ impl ProjectsView {
             .mouse_controls()
             .into_iter()
             .enumerate()
-            .flat_map(|(index, (label, _))| {
+            .flat_map(|(index, (label, target))| {
                 let mut spans = Vec::with_capacity(2);
                 if index > 0 {
                     spans.push(Span::raw(" "));
                 }
-                spans.push(Span::styled(label, ACCENT));
+                let hovered = self.is_target_hovered(target);
+                let style = if hovered {
+                    if matches!(target, MouseTarget::Cancel | MouseTarget::CancelInput) {
+                        HOVER_DANGER
+                    } else {
+                        HOVER_BUTTON
+                    }
+                } else {
+                    ACCENT
+                };
+                spans.push(Span::styled(label, style));
                 spans
             })
             .collect::<Vec<_>>();
@@ -1037,28 +1099,37 @@ impl ProjectsView {
         );
     }
     fn field(&self, frame: &mut Frame, area: Rect, label: &str, value: &str, focus: Focus) {
+        let prev_hovered = self.is_target_hovered(MouseTarget::Adjust(focus, -1));
+        let next_hovered = self.is_target_hovered(MouseTarget::Adjust(focus, 1));
+        let field_hovered = self.is_target_hovered(MouseTarget::Focus(focus));
+        let prev_style = if prev_hovered { HOVER_BUTTON } else { ACCENT };
+        let next_style = if next_hovered { HOVER_BUTTON } else { ACCENT };
+        let label_style = if self.focus == focus {
+            ACCENT
+        } else if field_hovered {
+            TITLE
+        } else {
+            MUTED
+        };
+        let value_style = if self.focus == focus {
+            SELECTED
+        } else if field_hovered {
+            Style::new().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("[‹] ", ACCENT),
-                Span::styled(
-                    format!("{label}: "),
-                    if self.focus == focus { ACCENT } else { MUTED },
-                ),
-                Span::styled(
-                    value,
-                    if self.focus == focus {
-                        SELECTED
-                    } else {
-                        Style::default()
-                    },
-                ),
+                Span::styled("[‹] ", prev_style),
+                Span::styled(format!("{label}: "), label_style),
+                Span::styled(value, value_style),
             ]))
             .wrap(Wrap { trim: true }),
             area,
         );
         if area.width >= 3 {
             frame.render_widget(
-                Paragraph::new(Span::styled("[›]", ACCENT)),
+                Paragraph::new(Span::styled("[›]", next_style)),
                 Rect::new(area.x + area.width - 3, area.y, 3, 1),
             );
         }
@@ -1212,5 +1283,25 @@ mod tests {
         assert!(contains(area, 6, 8));
         assert!(!contains(area, 7, 7));
         assert!(!contains(area, 4, 9));
+    }
+
+    #[test]
+    fn hit_region_contains_coords_and_mouse_event() {
+        let region = HitRegion {
+            area: Rect::new(5, 10, 8, 3),
+            target: MouseTarget::Build,
+        };
+        assert!(region.contains_coords(5, 10));
+        assert!(region.contains_coords(12, 12));
+        assert!(!region.contains_coords(13, 10));
+        assert!(!region.contains_coords(5, 13));
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 6,
+            row: 11,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(region.contains(mouse));
     }
 }
