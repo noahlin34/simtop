@@ -87,7 +87,7 @@ const AVAIL_W: u16 = 7;
 const MIN_NAME_W: u16 = 26; // Keep common names readable before showing metadata.
 const DISPLAY_PREFERENCES_FILE: &str = "display-preferences.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct DisplayPreferences {
     show_udid: bool,
@@ -95,17 +95,7 @@ struct DisplayPreferences {
     show_runtime: bool,
 }
 
-impl Default for DisplayPreferences {
-    fn default() -> Self {
-        Self {
-            show_udid: false,
-            show_device_type: false,
-            show_runtime: false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayPreference {
     Udid,
     DeviceType,
@@ -170,6 +160,15 @@ const HEADER: Style = Style::new()
     .add_modifier(Modifier::BOLD);
 const BORDER: Style = Style::new().fg(Color::DarkGray);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
+const HOVER_BUTTON: Style = Style::new()
+    .fg(Color::Cyan)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::REVERSED);
+const HOVER_ROW: Style = Style::new().add_modifier(Modifier::UNDERLINED);
+const HOVER_DANGER: Style = Style::new()
+    .fg(Color::Red)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::REVERSED);
 
 // ---------------------------------------------------------------------------
 // Session entry point.
@@ -202,6 +201,7 @@ fn init_terminal() -> io::Result<Term> {
         let _ = disable_raw_mode();
         return Err(error);
     }
+    let _ = stdout.write_all(b"\x1b[?1003h");
     stdout.flush()?;
     match Terminal::new(CrosstermBackend::new(stdout)) {
         Ok(terminal) => Ok(terminal),
@@ -215,12 +215,10 @@ fn init_terminal() -> io::Result<Term> {
 /// Best-effort restoration of the terminal; safe to call repeatedly.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    );
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(b"\x1b[?1003l");
+    let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = stdout.flush();
 }
 
 /// Chain a hook that restores the terminal if the UI panics mid-session.
@@ -318,7 +316,7 @@ impl Action {
 
 /// The capability-aware action categories; which ones are enabled for a
 /// device depends on its state and availability.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionKind {
     Boot,
     Shutdown,
@@ -455,7 +453,7 @@ enum InputMode {
 }
 
 /// Top-level content view selected by the persistent tabs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
     Simulators,
     Projects,
@@ -468,7 +466,7 @@ enum Focus {
     Logs,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseTarget {
     View(ActiveView),
     Device(usize),
@@ -488,7 +486,7 @@ enum MouseTarget {
     CancelEdit,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct HitRegion {
     area: Rect,
     target: MouseTarget,
@@ -634,6 +632,7 @@ struct App {
     show_preferences: bool,
     hit_regions: Vec<HitRegion>,
     last_area: Rect,
+    cursor_pos: Option<(u16, u16)>,
     dirty: bool,
     quit: bool,
 }
@@ -778,9 +777,22 @@ impl App {
             show_preferences: false,
             hit_regions: Vec::new(),
             last_area: Rect::default(),
+            cursor_pos: None,
             dirty: true,
             quit: false,
         })
+    }
+    fn hovered_target(&self) -> Option<MouseTarget> {
+        let (col, row) = self.cursor_pos?;
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|region| region.contains(col, row))
+            .map(|region| region.target)
+    }
+
+    fn is_target_hovered(&self, target: MouseTarget) -> bool {
+        self.hovered_target() == Some(target)
     }
 
     /// The main loop: drain channel events, poll keyboard, tick refresh,
@@ -1098,14 +1110,15 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let new_cursor_pos = Some((mouse.column, mouse.row));
+        let cursor_moved = self.cursor_pos != new_cursor_pos;
+        self.cursor_pos = new_cursor_pos;
+
         if self.active_view == ActiveView::Projects {
-            if matches!(
-                mouse.kind,
-                MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown
-            ) && self.projects.handle_mouse(mouse)
-            {
+            if self.projects.handle_mouse(mouse) {
+                self.dirty = true;
+            }
+            if cursor_moved {
                 self.dirty = true;
             }
             if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -1113,6 +1126,11 @@ impl App {
             }
         }
         match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if cursor_moved {
+                    self.dirty = true;
+                }
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 if self.active_view != ActiveView::Simulators {
                     return;
@@ -1694,6 +1712,9 @@ impl App {
     // -- rendering ----------------------------------------------------------
 
     fn draw(&mut self, terminal: &mut Term) -> io::Result<()> {
+        if self.hit_regions.is_empty() {
+            self.rebuild_hit_regions();
+        }
         terminal.draw(|frame| {
             let area = frame.area();
             self.last_area = area;
@@ -1719,7 +1740,12 @@ impl App {
                 if self.show_help {
                     render_help(frame, area);
                 } else if self.show_preferences {
-                    render_preferences(frame, area, &self.display_preferences);
+                    render_preferences(
+                        frame,
+                        area,
+                        &self.display_preferences,
+                        self.hovered_target(),
+                    );
                 }
                 if let InputMode::Edit {
                     kind,
@@ -1879,13 +1905,29 @@ impl App {
             Block::new().borders(Borders::BOTTOM).border_style(BORDER),
             area,
         );
+        let sim_hovered = self.is_target_hovered(MouseTarget::View(ActiveView::Simulators));
+        let proj_hovered = self.is_target_hovered(MouseTarget::View(ActiveView::Projects));
+        let quit_hovered = self.is_target_hovered(MouseTarget::Quit);
+
         let simulator_style = if self.active_view == ActiveView::Simulators {
-            ACCENT
+            if sim_hovered {
+                ACCENT.add_modifier(Modifier::REVERSED)
+            } else {
+                ACCENT
+            }
+        } else if sim_hovered {
+            INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             MUTED
         };
         let projects_style = if self.active_view == ActiveView::Projects {
-            ACCENT
+            if proj_hovered {
+                ACCENT.add_modifier(Modifier::REVERSED)
+            } else {
+                ACCENT
+            }
+        } else if proj_hovered {
+            INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             MUTED
         };
@@ -1898,8 +1940,15 @@ impl App {
             Rect::new(area.x, area.y, area.width, 1),
         );
         if area.width >= 6 {
+            let quit_style = if quit_hovered {
+                Style::new()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                ACCENT
+            };
             frame.render_widget(
-                Paragraph::new(Span::styled("[Quit]", ACCENT)),
+                Paragraph::new(Span::styled("[Quit]", quit_style)),
                 Rect::new(area.x + area.width - 6, area.y, 6, 1),
             );
         }
@@ -2022,16 +2071,31 @@ impl App {
             let device = &self.devices[self.filtered[index]];
             let y = body.y + row;
             let selected = self.selected == Some(index);
-            let row_style = if selected { SELECTED } else { Style::default() };
+            let hovered = self.is_target_hovered(MouseTarget::Device(index));
+            let row_style = if selected {
+                SELECTED
+            } else if hovered {
+                HOVER_ROW
+            } else {
+                Style::default()
+            };
             if selected {
                 buf.set_style(Rect::new(body.x, y, body.width, 1), SELECTED);
+            } else if hovered {
+                buf.set_style(Rect::new(body.x, y, body.width, 1), HOVER_ROW);
             }
             put(
                 buf,
                 body.x,
                 y,
                 MARKER_W,
-                if selected { ">" } else { " " },
+                if selected {
+                    ">"
+                } else if hovered {
+                    "›"
+                } else {
+                    " "
+                },
                 row_style,
             );
             put(
@@ -2145,10 +2209,17 @@ impl App {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("actions (available now)", LABEL));
                 for kind in available_actions(device) {
+                    let hovered = self.is_target_hovered(MouseTarget::Action(kind));
+                    let key_style = if hovered { HOVER_BUTTON } else { ACCENT };
+                    let label_style = if hovered {
+                        INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        INFO
+                    };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("[{}]", kind.key()), ACCENT),
+                        Span::styled(format!("[{}]", kind.key()), key_style),
                         Span::raw(" "),
-                        Span::styled(kind.label(), INFO),
+                        Span::styled(kind.label(), label_style),
                     ]));
                 }
                 lines.push(Line::raw(""));
@@ -2221,14 +2292,27 @@ impl App {
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let controls = self.mouse_controls();
-        let control_spans = controls.iter().enumerate().flat_map(|(index, (label, _))| {
-            let mut spans = Vec::with_capacity(2);
-            if index > 0 {
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::styled(label.clone(), ACCENT));
-            spans
-        });
+        let control_spans = controls
+            .iter()
+            .enumerate()
+            .flat_map(|(index, (label, target))| {
+                let mut spans = Vec::with_capacity(2);
+                if index > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                let hovered = self.is_target_hovered(*target);
+                let style = if hovered {
+                    if matches!(target, MouseTarget::Quit | MouseTarget::ConfirmDelete(true)) {
+                        HOVER_DANGER
+                    } else {
+                        HOVER_BUTTON
+                    }
+                } else {
+                    ACCENT
+                };
+                spans.push(Span::styled(label.clone(), style));
+                spans
+            });
         let text = match &self.mode {
             InputMode::Normal => Line::from(control_spans.collect::<Vec<_>>()),
             InputMode::Edit { kind, text, .. } => {
@@ -2469,7 +2553,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
-fn render_preferences(frame: &mut Frame, area: Rect, preferences: &DisplayPreferences) {
+
+fn render_preferences(
+    frame: &mut Frame,
+    area: Rect,
+    preferences: &DisplayPreferences,
+    hovered_target: Option<MouseTarget>,
+) {
     let popup = preferences_popup(area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -2489,15 +2579,22 @@ fn render_preferences(frame: &mut Frame, area: Rect, preferences: &DisplayPrefer
     ));
     for preference in DISPLAY_PREFERENCE_ORDER {
         let enabled = preference.is_enabled(preferences);
+        let hovered = hovered_target == Some(MouseTarget::Preference(preference));
+        let key_style = if hovered { HOVER_BUTTON } else { ACCENT };
+        let label_style = if hovered {
+            INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            INFO
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 if enabled { "[x]" } else { "[ ]" },
                 if enabled { ACCENT } else { MUTED },
             ),
             Span::raw(" "),
-            Span::styled(format!("[{}]", preference.key()), ACCENT),
+            Span::styled(format!("[{}]", preference.key()), key_style),
             Span::raw(" "),
-            Span::styled(preference.label(), INFO),
+            Span::styled(preference.label(), label_style),
         ]));
     }
     lines.push(Line::styled("u/t/r toggle · v or Esc close", LABEL));
@@ -2645,6 +2742,71 @@ fn delete_confirmation_accepts(key: KeyCode) -> bool {
 mod tests {
     use super::*;
 
+    struct TestBackend;
+    #[async_trait::async_trait]
+    impl SimulatorBackend for TestBackend {
+        async fn snapshot(&self) -> Result<DeviceSnapshot, SimtopError> {
+            Ok(DeviceSnapshot::new(1, "2026-08-17T00:00:00Z", vec![]))
+        }
+        async fn list_devices(&self) -> Result<Vec<SimDevice>, SimtopError> {
+            Ok(vec![])
+        }
+        async fn boot(&self, _udid: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn shutdown(&self, _udid: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn open(&self, _udid: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn create(
+            &self,
+            _name: &str,
+            _device_type: &str,
+            _runtime: &str,
+        ) -> Result<SimDevice, SimtopError> {
+            Err(SimtopError::new(
+                ErrorCode::UnsupportedOperation,
+                "unavailable in test backend",
+            ))
+        }
+        async fn delete(&self, _udid: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn install(&self, _udid: &str, _path: &Path) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn launch(
+            &self,
+            _udid: &str,
+            _bundle_id: &str,
+        ) -> Result<crate::model::LaunchInfo, SimtopError> {
+            Err(SimtopError::new(
+                ErrorCode::UnsupportedOperation,
+                "unavailable in test backend",
+            ))
+        }
+        async fn terminate(&self, _udid: &str, _bundle_id: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn uninstall(&self, _udid: &str, _bundle_id: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn open_url(&self, _udid: &str, _url: &str) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn screenshot(&self, _udid: &str, _path: &Path) -> Result<(), SimtopError> {
+            Ok(())
+        }
+        async fn logs(&self, _udid: &str) -> Result<crate::model::DeviceLog, SimtopError> {
+            Ok(crate::model::DeviceLog {
+                udid: _udid.to_string(),
+                entries: Vec::new(),
+            })
+        }
+    }
+
     #[test]
     fn delete_confirmation_defaults_to_no() {
         assert!(delete_confirmation_accepts(KeyCode::Char('y')));
@@ -2738,6 +2900,84 @@ mod tests {
         assert!(region.contains(13, 6));
         assert!(!region.contains(14, 5));
         assert!(!region.contains(10, 7));
+    }
+
+    #[test]
+    fn hovered_target_resolves_from_cursor_and_hit_regions() {
+        let mut app = App {
+            backend: Arc::new(TestBackend),
+            projects: ProjectsView::new(
+                Arc::new(TestBackend),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                PathBuf::from("."),
+            ),
+            active_view: ActiveView::Simulators,
+            tx: mpsc::channel(1).0,
+            rx: mpsc::channel(1).1,
+            config: TuiConfig::default(),
+            devices: Vec::new(),
+            generation: 0,
+            snapshot_time: String::new(),
+            filtered: Vec::new(),
+            selected: None,
+            selected_udid: None,
+            list_scroll: 0,
+            filter: String::new(),
+            state_filter: StateFilter::All,
+            refresh_in_flight: false,
+            logs_in_flight: false,
+            last_refresh: Instant::now(),
+            last_snapshot_error: None,
+            follow_udid: None,
+            logs: VecDeque::new(),
+            log_scroll: 0,
+            logs_visible: false,
+            activity: VecDeque::new(),
+            mode: InputMode::Normal,
+            focus: Focus::List,
+            confirm_delete: None,
+            display_preferences: DisplayPreferences::default(),
+            display_preferences_path: PathBuf::from("."),
+            show_help: false,
+            show_preferences: false,
+            hit_regions: vec![
+                HitRegion {
+                    area: Rect::new(0, 0, 14, 1),
+                    target: MouseTarget::View(ActiveView::Simulators),
+                },
+                HitRegion {
+                    area: Rect::new(15, 0, 12, 1),
+                    target: MouseTarget::View(ActiveView::Projects),
+                },
+                HitRegion {
+                    area: Rect::new(50, 0, 6, 1),
+                    target: MouseTarget::Quit,
+                },
+            ],
+            last_area: Rect::new(0, 0, 80, 24),
+            cursor_pos: None,
+            dirty: false,
+            quit: false,
+        };
+
+        assert_eq!(app.hovered_target(), None);
+        assert!(!app.is_target_hovered(MouseTarget::Quit));
+
+        app.cursor_pos = Some((5, 0));
+        assert_eq!(
+            app.hovered_target(),
+            Some(MouseTarget::View(ActiveView::Simulators))
+        );
+        assert!(app.is_target_hovered(MouseTarget::View(ActiveView::Simulators)));
+
+        app.cursor_pos = Some((52, 0));
+        assert_eq!(app.hovered_target(), Some(MouseTarget::Quit));
+        assert!(app.is_target_hovered(MouseTarget::Quit));
+
+        app.cursor_pos = Some((5, 5));
+        assert_eq!(app.hovered_target(), None);
     }
 
     fn test_device(state: DeviceState) -> SimDevice {
