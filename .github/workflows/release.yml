@@ -1,18 +1,14 @@
-# Release workflow: builds a universal (arm64 + x86_64) macOS `simtop` binary
-# from the tagged source and drafts a GitHub release with the archive.
+# Release workflow: builds a universal (arm64 + x86_64) macOS `simtop` binary,
+# creates a draft GitHub release, and updates the Homebrew formulae.
 #
-# The artifact is intentionally NOT codesigned: signing requires a Developer
-# ID certificate and notarization secrets that this repository does not have
-# (and must not pretend to have). The output is a plain universal Mach-O —
-# "signed-ready" — that can be ad-hoc re-signed for local use or submitted to
-# notarization later with real credentials. Do not add a codesign step that
-# runs without secrets; such a step would only fail or silently no-op.
+# Tags must look like `v<semver>` (for example, `v0.1.0`). The source archive
+# for the tag is used by Homebrew, so its checksum is calculated from the exact
+# tagged archive. The tap update is a direct commit, authenticated by the
+# fine-grained HOMEBREW_TAP_TOKEN secret.
 #
-# Tags must look like `v<semver>` (e.g. `v0.1.0`). The tag is also the
-# source archive that the Homebrew formula (Formula/simtop.rb) builds from,
-# so this workflow additionally publishes that archive's SHA-256 for the
-# formula's `sha256`. Manual runs must supply the `version` input: there is
-# no pushed tag to derive it from.
+# The artifact is intentionally not codesigned: signing requires a Developer
+# ID certificate and notarization secrets. The output is a plain universal
+# Mach-O that can be signed later with real credentials.
 
 name: Release
 
@@ -20,15 +16,9 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version without leading "v" (e.g. 0.1.0); required for manual runs (tag pushes derive it from the tag).'
-        required: true
-        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -38,32 +28,32 @@ jobs:
   build:
     name: Build simtop (${{ matrix.target }})
     runs-on: macos-15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    permissions:
+      contents: read
+
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      # stable always satisfies the crate's rust-version (1.74), so no MSRV
-      # pin is needed; each target is installed for the cross-arch build.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo build
+      - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      # Cross-compiling x86_64 from the arm64 runner needs no Rosetta; the
-      # build script compiles the Objective-C bridge for the target arch.
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Upload per-arch binary
+      - name: Upload per-architecture binary
         uses: actions/upload-artifact@v4
         with:
           name: simtop-${{ matrix.target }}
@@ -74,33 +64,41 @@ jobs:
     name: Package universal archive
     needs: build
     runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      source_sha256: ${{ steps.source.outputs.sha256 }}
+
     steps:
-      - name: Resolve version
+      - name: Resolve tag version
         id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${{ inputs.version }}"
-          if [[ -z "$VERSION" ]]; then
-            if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then
-              echo "::error::workflow_dispatch requires the 'version' input; there is no pushed tag to derive it from."
-              exit 1
-            fi
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
+          set -euo pipefail
+          VERSION="${REF_NAME#v}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::version must be a semantic version without a leading 'v' (got \"$VERSION\")."
+            echo "::error::release tag must contain a semantic version (got \"$REF_NAME\")"
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Download per-arch binaries
+      - name: Download per-architecture binaries
         uses: actions/download-artifact@v4
         with:
           path: dist
-          # Each artifact lands in dist/<artifact-name>/ so the two `simtop`
-          # binaries do not collide.
+          pattern: simtop-*-apple-darwin
           merge-multiple: false
 
-      - name: Lipo-merge universal binary
+      - name: Restore executable permissions
+        run: |
+          chmod +x \
+            dist/simtop-aarch64-apple-darwin/simtop \
+            dist/simtop-x86_64-apple-darwin/simtop
+
+      - name: Create universal binary
         run: |
           mkdir -p universal
           lipo -create \
@@ -110,35 +108,39 @@ jobs:
 
       - name: Verify universal binary
         run: |
+          test -x universal/simtop
           file universal/simtop
           lipo -info universal/simtop
 
-      - name: Smoke-test native slice
-        run: |
-          # --version is served before any CoreSimulator/Xcode requirement,
-          # so this runs on the arm64 slice of the universal binary.
-          ./universal/simtop --version
+      - name: Smoke-test binary
+        run: ./universal/simtop --version
 
-      - name: Stage and compress archive
+      - name: Package universal archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          set -euo pipefail
           STAGE="simtop-${VERSION}-darwin-universal"
           mkdir -p "${STAGE}/bin"
           cp universal/simtop "${STAGE}/bin/simtop"
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
-      - name: Compute source-archive checksum for the formula
+      - name: Compute tagged source checksum
+        id: source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          SOURCE_URL="https://github.com/${GITHUB_REPOSITORY_OWNER}/simtop/archive/refs/tags/v${VERSION}.tar.gz"
-          if curl -fsSL --retry 3 --retry-delay 2 -o "simtop-${VERSION}-source.tar.gz" "$SOURCE_URL"; then
-            shasum -a 256 "simtop-${VERSION}-source.tar.gz" > "simtop-${VERSION}-source.tar.gz.sha256"
-          else
-            echo "::warning::Could not fetch the v${VERSION} source archive (not tagged yet, or repository not public); the formula's sha256 must then be computed manually."
-          fi
+          set -euo pipefail
+          SOURCE_ARCHIVE="simtop-${VERSION}-source.tar.gz"
+          SOURCE_URL="https://github.com/${SOURCE_REPOSITORY}/archive/refs/tags/v${VERSION}.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$SOURCE_ARCHIVE" "$SOURCE_URL"
+          SOURCE_SHA256="$(shasum -a 256 "$SOURCE_ARCHIVE" | awk '{print $1}')"
+          printf '%s  %s\n' "$SOURCE_SHA256" "$SOURCE_ARCHIVE" > "${SOURCE_ARCHIVE}.sha256"
+          echo "sha256=${SOURCE_SHA256}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload universal archive
+      - name: Upload release archives
         uses: actions/upload-artifact@v4
         with:
           name: simtop-darwin-universal
@@ -147,12 +149,88 @@ jobs:
             simtop-*.tar.gz.sha256
           if-no-files-found: error
 
-  release:
-    name: Draft GitHub release
+  sync_source_formula:
+    name: Update source formula
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update formula metadata
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+          SOURCE_SHA256: ${{ needs.package.outputs.source_sha256 }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Formula/simtop.rb")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          source_sha256 = os.environ["SOURCE_SHA256"]
+          source_repository = os.environ["SOURCE_REPOSITORY"]
+          source_url = (
+              f"https://github.com/{source_repository}/archive/refs/tags/"
+              f"v{version}.tar.gz"
+          )
+
+          text, url_count = re.subn(
+              r'^  url "https://github\\.com/[^"]+/archive/refs/tags/'
+              r'v[^"]+\\.tar\\.gz"$',
+              f'  url "{source_url}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          text, sha_count = re.subn(
+              r'^  sha256 "[0-9a-f]{64}"$',
+              f'  sha256 "{source_sha256}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if url_count != 1 or sha_count != 1:
+              raise SystemExit(
+                  f"expected one URL and one SHA-256 in {path}, "
+                  f"found {url_count} and {sha_count}"
+              )
+          path.write_text(text)
+          PY
+
+      - name: Commit formula update
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/simtop.rb; then
+            echo "Source formula is already current."
+            exit 0
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/simtop.rb
+          git commit -m "Update Homebrew formula for v${VERSION}"
+          git push origin HEAD:main
+
+  release:
+    name: Draft GitHub release
+    needs: [package, sync_source_formula]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
     steps:
       - name: Download universal archive
         uses: actions/download-artifact@v4
@@ -165,4 +243,89 @@ jobs:
         with:
           draft: true
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
+
+  update_tap:
+    name: Update Homebrew tap
+    needs: [package, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.package.outputs.version }}
+      SOURCE_SHA256: ${{ needs.package.outputs.source_sha256 }}
+      SOURCE_REPOSITORY: ${{ github.repository }}
+
+    steps:
+      - name: Require tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN to a fine-grained token with Contents write access to noahlin34/homebrew-tap."
+            exit 1
+          fi
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: noahlin34/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update tap formula
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Formula/simtop.rb")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          source_sha256 = os.environ["SOURCE_SHA256"]
+          source_repository = os.environ["SOURCE_REPOSITORY"]
+          source_url = (
+              f"https://github.com/{source_repository}/archive/refs/tags/"
+              f"v{version}.tar.gz"
+          )
+
+          text, url_count = re.subn(
+              r'^  url "https://github\\.com/[^"]+/archive/refs/tags/'
+              r'v[^"]+\\.tar\\.gz"$',
+              f'  url "{source_url}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          text, sha_count = re.subn(
+              r'^  sha256 "[0-9a-f]{64}"$',
+              f'  sha256 "{source_sha256}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if url_count != 1 or sha_count != 1:
+              raise SystemExit(
+                  f"expected one URL and one SHA-256 in {path}, "
+                  f"found {url_count} and {sha_count}"
+              )
+          path.write_text(text)
+          PY
+
+      - name: Commit tap update
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/simtop.rb; then
+            echo "Tap formula is already current."
+            exit 0
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/simtop.rb
+          git commit -m "Update simtop to v${VERSION}"
+          git push origin HEAD:main
