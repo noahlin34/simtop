@@ -5,9 +5,10 @@ use super::super::error::{ErrorCode, SimtopError};
 use super::super::model::{DeviceSnapshot, SimDevice};
 use super::super::project::{self, ProjectId, ProjectMetadata, XcodeContainer, XcodeProject};
 use super::super::run::{ProjectRunCoordinator, ProjectRunEvent, ProjectRunStage};
+use super::theme::{Theme, ThemeName};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -20,20 +21,6 @@ const CHANNEL_CAPACITY: usize = 128;
 const MAX_OUTPUT_LINES: usize = 240;
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const DISCOVERY_DEPTH: usize = 3;
-const TITLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
-const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-const MUTED: Style = Style::new().fg(Color::DarkGray);
-const OK: Style = Style::new().fg(Color::Green);
-const ERR: Style = Style::new().fg(Color::Red);
-const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
-const HOVER_BUTTON: Style = Style::new()
-    .fg(Color::Cyan)
-    .add_modifier(Modifier::BOLD)
-    .add_modifier(Modifier::REVERSED);
-const HOVER_DANGER: Style = Style::new()
-    .fg(Color::Red)
-    .add_modifier(Modifier::BOLD)
-    .add_modifier(Modifier::REVERSED);
 
 #[derive(Debug)]
 pub(super) enum ProjectUiEvent {
@@ -162,6 +149,8 @@ pub(super) struct ProjectsView {
     status_error: bool,
     operation: Option<String>,
     active: Option<Active>,
+    theme_name: ThemeName,
+    theme: Theme,
     hit_regions: Vec<HitRegion>,
     last_area: Rect,
     cursor_pos: Option<(u16, u16)>,
@@ -178,6 +167,8 @@ impl ProjectsView {
         launch_dir: PathBuf,
     ) -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let theme_name = ThemeName::Dark;
+        let theme = Theme::for_name(theme_name);
         Self {
             backend,
             developer_dir,
@@ -205,12 +196,27 @@ impl ProjectsView {
             status_error: false,
             operation: None,
             active: None,
+            theme_name,
+            theme,
             hit_regions: Vec::new(),
             last_area: Rect::default(),
             cursor_pos: None,
             tx,
             rx,
         }
+    }
+    pub(crate) fn set_theme(&mut self, theme_name: ThemeName) {
+        if self.theme_name == theme_name {
+            return;
+        }
+        self.theme_name = theme_name;
+        self.theme = Theme::for_name(theme_name);
+        self.dirty = true;
+    }
+    fn base_style(&self) -> Style {
+        Style::new()
+            .fg(self.theme.foreground)
+            .bg(self.theme.background)
     }
     fn hovered_target(&self) -> Option<MouseTarget> {
         let (col, row) = self.cursor_pos?;
@@ -470,7 +476,10 @@ impl ProjectsView {
     pub(super) fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.last_area = area;
         if area.width < 40 || area.height < 5 {
-            frame.render_widget(Paragraph::new("terminal too small for Projects"), area);
+            frame.render_widget(
+                Paragraph::new("terminal too small for Projects").style(self.theme.warning),
+                area,
+            );
             self.hit_regions.clear();
             self.dirty = false;
             return;
@@ -984,24 +993,27 @@ impl ProjectsView {
                 } else {
                     " "
                 };
-                let detail = if row.loading {
-                    "  loading metadata…".to_string()
+                let (detail, detail_style) = if row.loading {
+                    ("  loading metadata…".to_string(), self.theme.info)
                 } else if let Some(error) = &row.error {
-                    format!("  metadata: {error}")
+                    (format!("  metadata: {error}"), self.theme.error)
                 } else {
-                    format!("  {}", row.project.directory.display())
+                    (
+                        format!("  {}", row.project.directory.display()),
+                        self.theme.muted,
+                    )
                 };
                 let title_style = if hovered && !selected {
-                    Style::new().add_modifier(Modifier::UNDERLINED)
+                    self.theme.hover_row
                 } else {
-                    Style::default()
+                    self.base_style()
                 };
                 ListItem::new(vec![
                     Line::from(Span::styled(
                         format!("{marker} {}", row.project.name),
                         title_style,
                     )),
-                    Line::from(Span::styled(detail, MUTED)),
+                    Line::from(Span::styled(detail, detail_style)),
                 ])
             })
             .collect::<Vec<_>>();
@@ -1012,22 +1024,29 @@ impl ProjectsView {
         };
         frame.render_stateful_widget(
             List::new(items)
+                .style(self.base_style())
                 .block(
                     Block::default()
-                        .title(Line::from(Span::styled(title, TITLE)))
-                        .borders(Borders::ALL),
+                        .style(self.base_style())
+                        .title(Line::from(Span::styled(title, self.theme.header)))
+                        .borders(Borders::ALL)
+                        .border_style(self.theme.border),
                 )
                 .highlight_style(if self.focus == Focus::Projects {
-                    SELECTED
+                    self.theme.selected
                 } else {
-                    Style::default()
+                    self.base_style()
                 }),
             area,
             &mut state,
         );
     }
     fn setup(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default().title(" Setup ").borders(Borders::ALL);
+        let block = Block::default()
+            .style(self.base_style())
+            .title(Line::from(Span::styled(" Setup ", self.theme.header)))
+            .borders(Borders::ALL)
+            .border_style(self.theme.border);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let rows = Layout::default()
@@ -1082,19 +1101,21 @@ impl ProjectsView {
                 let hovered = self.is_target_hovered(target);
                 let style = if hovered {
                     if matches!(target, MouseTarget::Cancel | MouseTarget::CancelInput) {
-                        HOVER_DANGER
+                        self.theme.hover_danger
                     } else {
-                        HOVER_BUTTON
+                        self.theme.hover_button
                     }
                 } else {
-                    ACCENT
+                    self.theme.accent
                 };
                 spans.push(Span::styled(label, style));
                 spans
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }),
+            Paragraph::new(Line::from(spans))
+                .style(self.base_style())
+                .wrap(Wrap { trim: true }),
             rows[4],
         );
     }
@@ -1102,21 +1123,29 @@ impl ProjectsView {
         let prev_hovered = self.is_target_hovered(MouseTarget::Adjust(focus, -1));
         let next_hovered = self.is_target_hovered(MouseTarget::Adjust(focus, 1));
         let field_hovered = self.is_target_hovered(MouseTarget::Focus(focus));
-        let prev_style = if prev_hovered { HOVER_BUTTON } else { ACCENT };
-        let next_style = if next_hovered { HOVER_BUTTON } else { ACCENT };
-        let label_style = if self.focus == focus {
-            ACCENT
-        } else if field_hovered {
-            TITLE
+        let prev_style = if prev_hovered {
+            self.theme.hover_button
         } else {
-            MUTED
+            self.theme.accent
+        };
+        let next_style = if next_hovered {
+            self.theme.hover_button
+        } else {
+            self.theme.accent
+        };
+        let label_style = if self.focus == focus {
+            self.theme.accent
+        } else if field_hovered {
+            self.theme.label
+        } else {
+            self.theme.muted
         };
         let value_style = if self.focus == focus {
-            SELECTED
+            self.theme.selected
         } else if field_hovered {
-            Style::new().add_modifier(Modifier::UNDERLINED)
+            self.theme.hover_row
         } else {
-            Style::default()
+            self.base_style()
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1124,12 +1153,13 @@ impl ProjectsView {
                 Span::styled(format!("{label}: "), label_style),
                 Span::styled(value, value_style),
             ]))
+            .style(self.base_style())
             .wrap(Wrap { trim: true }),
             area,
         );
         if area.width >= 3 {
             frame.render_widget(
-                Paragraph::new(Span::styled("[›]", next_style)),
+                Paragraph::new(Span::styled("[›]", next_style)).style(self.base_style()),
                 Rect::new(area.x + area.width - 3, area.y, 3, 1),
             );
         }
@@ -1144,12 +1174,16 @@ impl ProjectsView {
             .rev()
             .map(|line| Line::from(line.as_str()))
             .collect::<Vec<_>>();
+        let title = self.operation.as_deref().unwrap_or("Output");
         frame.render_widget(
             Paragraph::new(lines)
+                .style(self.base_style())
                 .block(
                     Block::default()
-                        .title(self.operation.as_deref().unwrap_or("Output"))
-                        .borders(Borders::ALL),
+                        .style(self.base_style())
+                        .title(Line::from(Span::styled(title, self.theme.header)))
+                        .borders(Borders::ALL)
+                        .border_style(self.theme.border),
                 )
                 .wrap(Wrap { trim: false }),
             area,
@@ -1251,15 +1285,29 @@ impl ProjectsView {
         let mut spans = vec![
             Span::styled(
                 if self.status_error { "! " } else { "· " },
-                if self.status_error { ERR } else { OK },
+                if self.status_error {
+                    self.theme.error
+                } else {
+                    self.theme.success
+                },
             ),
             Span::raw(self.status.as_str()),
         ];
         if let Some(config_status) = &self.config_status {
-            spans.push(Span::styled(format!(" [{config_status}]"), MUTED));
+            spans.push(Span::styled(
+                format!(" [{config_status}]"),
+                self.theme.muted,
+            ));
         }
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::TOP)),
+            Paragraph::new(Line::from(spans))
+                .style(self.base_style())
+                .block(
+                    Block::default()
+                        .style(self.base_style())
+                        .borders(Borders::TOP)
+                        .border_style(self.theme.border),
+                ),
             area,
         );
     }
@@ -1275,6 +1323,7 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     #[test]
     fn rectangle_contains_only_its_cells() {
@@ -1303,5 +1352,23 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
         assert!(region.contains(mouse));
+    }
+    #[test]
+    fn light_and_catppuccin_themes_change_palette_without_losing_interaction_styles() {
+        let dark = Theme::for_name(ThemeName::Dark);
+        let light = Theme::for_name(ThemeName::Light);
+        let catppuccin = Theme::for_name(ThemeName::Catppuccin);
+
+        assert_ne!(dark.accent, light.accent);
+        assert_ne!(light.accent, catppuccin.accent);
+        for theme in [light, catppuccin] {
+            assert!(theme.selected.add_modifier.contains(Modifier::REVERSED));
+            assert!(theme.hover_button.add_modifier.contains(Modifier::BOLD));
+            assert!(theme.hover_button.add_modifier.contains(Modifier::REVERSED));
+            assert!(theme.hover_row.add_modifier.contains(Modifier::UNDERLINED));
+            assert!(theme.hover_danger.add_modifier.contains(Modifier::BOLD));
+            assert!(theme.hover_danger.add_modifier.contains(Modifier::REVERSED));
+            assert_ne!(theme.error, theme.success);
+        }
     }
 }
