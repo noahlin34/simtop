@@ -9,11 +9,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use self::theme::ThemeName;
 use crate::backend::SimulatorBackend;
 use crate::error::SimtopError;
 
 mod projects;
 mod simulators;
+pub mod theme;
 /// Default bound for the activity history.
 const DEFAULT_ACTIVITY_CAP: usize = 200;
 /// Default bound for the followed device-log buffer.
@@ -36,6 +38,8 @@ pub struct TuiConfig {
     pub cache_root: Option<PathBuf>,
     /// Working directory used to launch built applications.
     pub launch_dir: Option<PathBuf>,
+    /// Explicit startup palette override; `None` uses the persisted preference.
+    pub theme: Option<ThemeName>,
 }
 
 impl Default for TuiConfig {
@@ -48,6 +52,7 @@ impl Default for TuiConfig {
             config_path: None,
             cache_root: None,
             launch_dir: None,
+            theme: None,
         }
     }
 }
