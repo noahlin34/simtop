@@ -125,6 +125,10 @@ struct Cli {
     #[arg(long, global = true)]
     no_input: bool,
 
+    /// Theme override for the interactive TUI.
+    #[arg(long, global = true, value_name = "THEME")]
+    theme: Option<crate::tui::theme::ThemeName>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -295,7 +299,7 @@ async fn dispatch(cli: &Cli, out: &Output) -> Result<(), RunError> {
                     "the interactive TUI cannot be combined with --json or --no-input",
                 )));
             }
-            let config = tui_config(xcode.developer_dir())?;
+            let config = tui_config(xcode.developer_dir(), cli.theme)?;
             crate::tui::run_with(backend, config)
                 .await
                 .map_err(RunError::Failed)
@@ -307,7 +311,10 @@ async fn dispatch(cli: &Cli, out: &Output) -> Result<(), RunError> {
     }
 }
 
-fn tui_config(developer_dir: &Path) -> Result<crate::tui::TuiConfig, RunError> {
+fn tui_config(
+    developer_dir: &Path,
+    theme: Option<crate::tui::theme::ThemeName>,
+) -> Result<crate::tui::TuiConfig, RunError> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -327,6 +334,7 @@ fn tui_config(developer_dir: &Path) -> Result<crate::tui::TuiConfig, RunError> {
                 .join("simtop"),
         ),
         launch_dir: Some(launch_dir),
+        theme,
         ..crate::tui::TuiConfig::default()
     })
 }
@@ -763,6 +771,38 @@ mod tests {
         let backend = FakeBackend::new(vec![device("AAAA-1", "iPhone 16 Pro")]);
         let err = resolve_device(&backend, "nope").await.unwrap_err();
         assert_eq!(err.code(), ErrorCode::DeviceNotFound);
+    }
+
+    #[test]
+    fn theme_defaults_to_none() {
+        let cli = Cli::try_parse_from(["simtop"]).unwrap();
+        assert_eq!(cli.theme, None);
+    }
+
+    #[test]
+    fn theme_accepts_all_canonical_values() {
+        for theme in crate::tui::theme::ThemeName::ALL.iter().copied() {
+            let value = theme.to_string();
+            let cli = Cli::try_parse_from(["simtop", "--theme", value.as_str()]).unwrap();
+            assert_eq!(cli.theme, Some(theme));
+        }
+    }
+
+    #[test]
+    fn theme_rejects_invalid_values() {
+        let err = Cli::try_parse_from(["simtop", "--theme", "not-a-theme"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn theme_is_global_before_and_after_subcommand() {
+        let before = Cli::try_parse_from(["simtop", "--theme", "nord", "list"]).unwrap();
+        assert_eq!(before.theme, Some(crate::tui::theme::ThemeName::Nord));
+        assert!(matches!(before.command, Some(Command::List)));
+
+        let after = Cli::try_parse_from(["simtop", "list", "--theme", "nord"]).unwrap();
+        assert_eq!(after.theme, Some(crate::tui::theme::ThemeName::Nord));
+        assert!(matches!(after.command, Some(Command::List)));
     }
 
     #[test]
