@@ -53,7 +53,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -65,6 +65,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::SimulatorBackend;
 use crate::error::{ErrorCode, SimtopError};
 use crate::model::{DeviceLog, DeviceSnapshot, DeviceState, SimDevice};
+use crate::tui::theme::{Theme, ThemeName};
 
 /// Terminal backend used by the whole TUI.
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
@@ -93,6 +94,8 @@ struct DisplayPreferences {
     show_udid: bool,
     show_device_type: bool,
     show_runtime: bool,
+    #[serde(default)]
+    theme: ThemeName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,31 +147,7 @@ impl DisplayPreference {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Theme tokens: a single set of named styles so the whole UI stays coherent.
-// ---------------------------------------------------------------------------
-
-const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-const MUTED: Style = Style::new().fg(Color::DarkGray);
-const INFO: Style = Style::new().fg(Color::White);
-const OK: Style = Style::new().fg(Color::Green);
-const WARN: Style = Style::new().fg(Color::Yellow);
-const ERR: Style = Style::new().fg(Color::Red);
-const LABEL: Style = Style::new().fg(Color::DarkGray);
-const HEADER: Style = Style::new()
-    .fg(Color::DarkGray)
-    .add_modifier(Modifier::BOLD);
-const BORDER: Style = Style::new().fg(Color::DarkGray);
-const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
-const HOVER_BUTTON: Style = Style::new()
-    .fg(Color::Cyan)
-    .add_modifier(Modifier::BOLD)
-    .add_modifier(Modifier::REVERSED);
-const HOVER_ROW: Style = Style::new().add_modifier(Modifier::UNDERLINED);
-const HOVER_DANGER: Style = Style::new()
-    .fg(Color::Red)
-    .add_modifier(Modifier::BOLD)
-    .add_modifier(Modifier::REVERSED);
+// Semantic colors come from Theme; this view never owns a hard-coded palette.
 
 // ---------------------------------------------------------------------------
 // Session entry point.
@@ -481,6 +460,7 @@ enum MouseTarget {
     Quit,
     CloseOverlay,
     Preference(DisplayPreference),
+    Theme(ThemeName),
     ConfirmDelete(bool),
     SubmitEdit,
     CancelEdit,
@@ -573,12 +553,12 @@ impl ActivityLine {
         ActivityLine::new(ActivityKind::Err, text)
     }
 
-    fn style(&self) -> Style {
+    fn style(&self, theme: Theme) -> Style {
         match self.kind {
-            ActivityKind::Info => INFO,
-            ActivityKind::Ok => OK,
-            ActivityKind::Warn => WARN,
-            ActivityKind::Err => ERR,
+            ActivityKind::Info => theme.info,
+            ActivityKind::Ok => theme.success,
+            ActivityKind::Warn => theme.warning,
+            ActivityKind::Err => theme.error,
         }
     }
 }
@@ -601,6 +581,8 @@ struct App {
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     config: TuiConfig,
+    theme_name: ThemeName,
+    theme: Theme,
 
     devices: Vec<SimDevice>,
     generation: u64,
@@ -628,6 +610,8 @@ struct App {
     confirm_delete: Option<String>,
     display_preferences: DisplayPreferences,
     display_preferences_path: PathBuf,
+    preferences_before_overlay: Option<DisplayPreferences>,
+    theme_before_overlay: Option<ThemeName>,
     show_help: bool,
     show_preferences: bool,
     hit_regions: Vec<HitRegion>,
@@ -731,9 +715,12 @@ impl App {
             ..config
         };
         let preferences_path = display_preferences_path(&config);
-        let display_preferences = DisplayPreferences::load(&preferences_path)?;
+        let mut display_preferences = DisplayPreferences::load(&preferences_path)?;
+        let theme_name = config.theme.unwrap_or(display_preferences.theme);
+        display_preferences.theme = theme_name;
+        let theme = Theme::for_name(theme_name);
         let backend: Arc<dyn SimulatorBackend> = Arc::from(backend);
-        let projects = ProjectsView::new(
+        let mut projects = ProjectsView::new(
             Arc::clone(&backend),
             config
                 .developer_dir
@@ -743,6 +730,7 @@ impl App {
             project_cache_root(&config),
             project_launch_dir(&config),
         );
+        projects.set_theme(theme_name);
         Ok(App {
             backend,
             projects,
@@ -750,6 +738,8 @@ impl App {
             tx,
             rx,
             config,
+            theme_name,
+            theme,
             devices: Vec::new(),
             generation: 0,
             snapshot_time: String::new(),
@@ -773,6 +763,8 @@ impl App {
             confirm_delete: None,
             display_preferences,
             display_preferences_path: preferences_path,
+            preferences_before_overlay: None,
+            theme_before_overlay: None,
             show_help: false,
             show_preferences: false,
             hit_regions: Vec::new(),
@@ -1193,20 +1185,21 @@ impl App {
                 self.recompute_filter();
             }
             MouseTarget::ToggleLogs => self.toggle_logs(),
-            MouseTarget::Preferences => {
-                self.show_preferences = true;
-                self.show_help = false;
-            }
+            MouseTarget::Preferences => self.open_preferences(),
             MouseTarget::Help => {
                 self.show_help = true;
                 self.show_preferences = false;
             }
             MouseTarget::Quit => self.quit = true,
             MouseTarget::CloseOverlay => {
-                self.show_help = false;
-                self.show_preferences = false;
+                if self.show_preferences {
+                    self.close_preferences(true);
+                } else {
+                    self.show_help = false;
+                }
             }
             MouseTarget::Preference(preference) => self.toggle_display_preference(preference),
+            MouseTarget::Theme(theme) => self.preview_theme(theme),
             MouseTarget::ConfirmDelete(confirmed) => {
                 if let Some(udid) = self.confirm_delete.take() {
                     if confirmed {
@@ -1262,10 +1255,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char('v') => {
-                self.show_preferences = true;
-                self.show_help = false;
-            }
+            KeyCode::Char('v') => self.open_preferences(),
             KeyCode::Char('/') => self.start_edit(EditKind::Search, self.filter.clone()),
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 self.state_filter = self.state_filter.next();
@@ -1309,26 +1299,78 @@ impl App {
     }
     fn handle_preferences_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('v') | KeyCode::Char('q') | KeyCode::Esc => {
-                self.show_preferences = false;
-            }
+            KeyCode::Char('v') | KeyCode::Char('q') => self.close_preferences(true),
+            KeyCode::Esc => self.close_preferences(false),
+            KeyCode::Enter => self.close_preferences(true),
             KeyCode::Char('u') => self.toggle_display_preference(DisplayPreference::Udid),
             KeyCode::Char('t') => self.toggle_display_preference(DisplayPreference::DeviceType),
             KeyCode::Char('r') => self.toggle_display_preference(DisplayPreference::Runtime),
+            KeyCode::Left | KeyCode::Char('h') => self.cycle_theme(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.cycle_theme(1),
             _ => {}
         }
     }
 
     fn toggle_display_preference(&mut self, preference: DisplayPreference) {
         preference.toggle(&mut self.display_preferences);
-        if let Err(error) = self
-            .display_preferences
-            .save(&self.display_preferences_path)
-        {
-            self.push_activity(ActivityLine::err(format!(
-                "saving display preferences failed: {error}"
-            )));
+        self.dirty = true;
+    }
+    fn open_preferences(&mut self) {
+        self.preferences_before_overlay = Some(self.display_preferences);
+        self.theme_before_overlay = Some(self.theme_name);
+        self.show_preferences = true;
+        self.show_help = false;
+        self.dirty = true;
+    }
+
+    fn close_preferences(&mut self, save: bool) {
+        if !save {
+            if let Some(preferences) = self.preferences_before_overlay.take() {
+                self.display_preferences = preferences;
+            }
+            if let Some(theme_name) = self.theme_before_overlay.take() {
+                self.set_theme(theme_name);
+            }
+        } else {
+            self.preferences_before_overlay = None;
+            self.theme_before_overlay = None;
+            if let Err(error) = self
+                .display_preferences
+                .save(&self.display_preferences_path)
+            {
+                self.push_activity(ActivityLine::err(format!(
+                    "saving display preferences failed: {error}"
+                )));
+            }
         }
+        self.show_preferences = false;
+        self.dirty = true;
+    }
+
+    fn set_theme(&mut self, theme_name: ThemeName) {
+        self.theme_name = theme_name;
+        self.theme = Theme::for_name(theme_name);
+        self.display_preferences.theme = theme_name;
+        self.projects.set_theme(theme_name);
+        self.dirty = true;
+    }
+
+    fn preview_theme(&mut self, theme_name: ThemeName) {
+        if self.theme_name != theme_name {
+            self.set_theme(theme_name);
+        } else {
+            self.dirty = true;
+        }
+    }
+
+    fn cycle_theme(&mut self, delta: isize) {
+        let all = ThemeName::ALL;
+        let current = all
+            .iter()
+            .position(|&theme| theme == self.theme_name)
+            .unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(all.len() as isize) as usize;
+        self.preview_theme(all[next]);
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) {
@@ -1718,8 +1760,16 @@ impl App {
         terminal.draw(|frame| {
             let area = frame.area();
             self.last_area = area;
+            frame.render_widget(
+                Block::new().style(
+                    Style::default()
+                        .fg(self.theme.foreground)
+                        .bg(self.theme.background),
+                ),
+                area,
+            );
             if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-                render_too_small(frame, area);
+                render_too_small(frame, area, self.theme);
                 return;
             }
             let rects = compute_layout(area);
@@ -1738,13 +1788,15 @@ impl App {
                 self.render_activity(frame, rects.activity);
                 self.render_status(frame, rects.status);
                 if self.show_help {
-                    render_help(frame, area);
+                    render_help(frame, area, self.theme);
                 } else if self.show_preferences {
                     render_preferences(
                         frame,
                         area,
                         &self.display_preferences,
+                        self.theme_name,
                         self.hovered_target(),
+                        self.theme,
                     );
                 }
                 if let InputMode::Edit {
@@ -1867,6 +1919,13 @@ impl App {
                     target: MouseTarget::Preference(preference),
                 });
             }
+            let theme_start = inner.y + 2 + DISPLAY_PREFERENCE_ORDER.len() as u16;
+            for (row, theme) in ThemeName::ALL.iter().copied().enumerate() {
+                self.hit_regions.push(HitRegion {
+                    area: Rect::new(inner.x, theme_start + row as u16, inner.width, 1),
+                    target: MouseTarget::Theme(theme),
+                });
+            }
         }
     }
 
@@ -1902,7 +1961,9 @@ impl App {
 
     fn render_top(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(
-            Block::new().borders(Borders::BOTTOM).border_style(BORDER),
+            Block::new()
+                .borders(Borders::BOTTOM)
+                .border_style(self.theme.border),
             area,
         );
         let sim_hovered = self.is_target_hovered(MouseTarget::View(ActiveView::Simulators));
@@ -1911,25 +1972,29 @@ impl App {
 
         let simulator_style = if self.active_view == ActiveView::Simulators {
             if sim_hovered {
-                ACCENT.add_modifier(Modifier::REVERSED)
+                self.theme.accent.add_modifier(Modifier::REVERSED)
             } else {
-                ACCENT
+                self.theme.accent
             }
         } else if sim_hovered {
-            INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            self.theme
+                .info
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            MUTED
+            self.theme.muted
         };
         let projects_style = if self.active_view == ActiveView::Projects {
             if proj_hovered {
-                ACCENT.add_modifier(Modifier::REVERSED)
+                self.theme.accent.add_modifier(Modifier::REVERSED)
             } else {
-                ACCENT
+                self.theme.accent
             }
         } else if proj_hovered {
-            INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            self.theme
+                .info
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            MUTED
+            self.theme.muted
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1941,11 +2006,9 @@ impl App {
         );
         if area.width >= 6 {
             let quit_style = if quit_hovered {
-                Style::new()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                self.theme.hover_danger
             } else {
-                ACCENT
+                self.theme.accent
             };
             frame.render_widget(
                 Paragraph::new(Span::styled("[Quit]", quit_style)),
@@ -1974,7 +2037,7 @@ impl App {
             area.y + 1,
             area.width,
             &meta,
-            MUTED,
+            self.theme.muted,
         );
     }
 
@@ -1998,7 +2061,13 @@ impl App {
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
-        let body = pane_head(frame, area, &self.list_title(), self.focus == Focus::List);
+        let body = pane_head(
+            frame,
+            area,
+            &self.list_title(),
+            self.focus == Focus::List,
+            self.theme,
+        );
         let width = body.width;
         let columns = list_columns(width, &self.display_preferences);
         let name_width = columns.name_width;
@@ -2030,7 +2099,14 @@ impl App {
             let message_width = message.chars().count() as u16;
             let x = (body.x + body.width.saturating_sub(message_width) / 2).max(body.x);
             let y = body.y + body.height / 2;
-            put(frame.buffer_mut(), x, y, body.width, &message, MUTED);
+            put(
+                frame.buffer_mut(),
+                x,
+                y,
+                body.width,
+                &message,
+                self.theme.muted,
+            );
             return;
         }
 
@@ -2048,19 +2124,40 @@ impl App {
 
         let buf = frame.buffer_mut();
         // Header row.
-        put(buf, state_x, body.y, STATE_W - 1, "STATE", HEADER);
-        put(buf, name_x, body.y, name_width - 1, "NAME", HEADER);
+        put(
+            buf,
+            state_x,
+            body.y,
+            STATE_W - 1,
+            "STATE",
+            self.theme.header,
+        );
+        put(
+            buf,
+            name_x,
+            body.y,
+            name_width - 1,
+            "NAME",
+            self.theme.header,
+        );
         if show_udid {
-            put(buf, udid_x, body.y, UDID_W - 1, "UDID", HEADER);
+            put(buf, udid_x, body.y, UDID_W - 1, "UDID", self.theme.header);
         }
         if show_rt {
-            put(buf, rt_x, body.y, RT_W - 1, "RUNTIME", HEADER);
+            put(buf, rt_x, body.y, RT_W - 1, "RUNTIME", self.theme.header);
         }
         if show_os {
-            put(buf, os_x, body.y, OS_W - 1, "OS", HEADER);
+            put(buf, os_x, body.y, OS_W - 1, "OS", self.theme.header);
         }
         if show_avail {
-            put(buf, avail_x, body.y, AVAIL_W - 1, "AVAIL", HEADER);
+            put(
+                buf,
+                avail_x,
+                body.y,
+                AVAIL_W - 1,
+                "AVAIL",
+                self.theme.header,
+            );
         }
 
         for row in 0..body.height {
@@ -2073,16 +2170,16 @@ impl App {
             let selected = self.selected == Some(index);
             let hovered = self.is_target_hovered(MouseTarget::Device(index));
             let row_style = if selected {
-                SELECTED
+                self.theme.selected
             } else if hovered {
-                HOVER_ROW
+                self.theme.hover_row
             } else {
                 Style::default()
             };
             if selected {
-                buf.set_style(Rect::new(body.x, y, body.width, 1), SELECTED);
+                buf.set_style(Rect::new(body.x, y, body.width, 1), self.theme.selected);
             } else if hovered {
-                buf.set_style(Rect::new(body.x, y, body.width, 1), HOVER_ROW);
+                buf.set_style(Rect::new(body.x, y, body.width, 1), self.theme.hover_row);
             }
             put(
                 buf,
@@ -2104,9 +2201,13 @@ impl App {
                 y,
                 STATE_W - 1,
                 state_short(&device.state),
-                state_style(&device.state).patch(row_style),
+                state_style(&device.state, self.theme).patch(row_style),
             );
-            let name_style = if device.is_available { INFO } else { MUTED };
+            let name_style = if device.is_available {
+                self.theme.info
+            } else {
+                self.theme.muted
+            };
             put(
                 buf,
                 name_x,
@@ -2122,12 +2223,19 @@ impl App {
                     y,
                     UDID_W - 1,
                     &device.udid,
-                    MUTED.patch(row_style),
+                    self.theme.muted.patch(row_style),
                 );
             }
             if show_rt {
                 let runtime = device.runtime.rsplit('.').next().unwrap_or(&device.runtime);
-                put(buf, rt_x, y, RT_W - 1, runtime, MUTED.patch(row_style));
+                put(
+                    buf,
+                    rt_x,
+                    y,
+                    RT_W - 1,
+                    runtime,
+                    self.theme.muted.patch(row_style),
+                );
             }
             if show_os {
                 put(
@@ -2136,14 +2244,14 @@ impl App {
                     y,
                     OS_W - 1,
                     &device.os_version,
-                    INFO.patch(row_style),
+                    self.theme.info.patch(row_style),
                 );
             }
             if show_avail {
                 let (text, style) = if device.is_available {
-                    ("yes", OK)
+                    ("yes", self.theme.success)
                 } else {
-                    ("no", ERR)
+                    ("no", self.theme.error)
                 };
                 put(buf, avail_x, y, AVAIL_W - 1, text, style.patch(row_style));
             }
@@ -2158,63 +2266,76 @@ impl App {
     }
 
     fn render_details(&self, frame: &mut Frame, area: Rect) {
-        let body = pane_head(frame, area, &self.details_title(), false);
+        let body = pane_head(frame, area, &self.details_title(), false, self.theme);
         let mut lines: Vec<Line> = Vec::new();
         match self.selected_device() {
             Some(device) => {
                 if self.display_preferences.show_udid {
                     lines.push(Line::from(vec![
-                        Span::styled("udid", LABEL),
+                        Span::styled("udid", self.theme.label),
                         Span::raw("  "),
                         Span::raw(device.udid.clone()),
                     ]));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("name", LABEL),
+                    Span::styled("name", self.theme.label),
                     Span::raw("  "),
                     Span::raw(device.name.clone()),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("state", LABEL),
+                    Span::styled("state", self.theme.label),
                     Span::raw("  "),
-                    Span::styled(device.state.to_string(), state_style(&device.state)),
+                    Span::styled(
+                        device.state.to_string(),
+                        state_style(&device.state, self.theme),
+                    ),
                 ]));
                 if self.display_preferences.show_device_type {
                     lines.push(Line::from(vec![
-                        Span::styled("type", LABEL),
+                        Span::styled("type", self.theme.label),
                         Span::raw("  "),
                         Span::raw(device.device_type.clone()),
                     ]));
                 }
                 if self.display_preferences.show_runtime {
                     lines.push(Line::from(vec![
-                        Span::styled("runtime", LABEL),
+                        Span::styled("runtime", self.theme.label),
                         Span::raw("  "),
                         Span::raw(device.runtime.clone()),
                     ]));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("os", LABEL),
+                    Span::styled("os", self.theme.label),
                     Span::raw("  "),
                     Span::raw(device.os_version.clone()),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("available", LABEL),
+                    Span::styled("available", self.theme.label),
                     Span::raw("  "),
                     Span::styled(
                         if device.is_available { "yes" } else { "no" },
-                        if device.is_available { OK } else { ERR },
+                        if device.is_available {
+                            self.theme.success
+                        } else {
+                            self.theme.error
+                        },
                     ),
                 ]));
                 lines.push(Line::raw(""));
-                lines.push(Line::styled("actions (available now)", LABEL));
+                lines.push(Line::styled("actions (available now)", self.theme.label));
                 for kind in available_actions(device) {
                     let hovered = self.is_target_hovered(MouseTarget::Action(kind));
-                    let key_style = if hovered { HOVER_BUTTON } else { ACCENT };
-                    let label_style = if hovered {
-                        INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    let key_style = if hovered {
+                        self.theme.hover_button
                     } else {
-                        INFO
+                        self.theme.accent
+                    };
+                    let label_style = if hovered {
+                        self.theme
+                            .info
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        self.theme.info
                     };
                     lines.push(Line::from(vec![
                         Span::styled(format!("[{}]", kind.key()), key_style),
@@ -2225,11 +2346,11 @@ impl App {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     "Enter = boot when shutdown, open when booted",
-                    LABEL,
+                    self.theme.label,
                 ));
             }
             None => {
-                lines.push(Line::styled("no device selected", MUTED));
+                lines.push(Line::styled("no device selected", self.theme.muted));
             }
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
@@ -2248,7 +2369,13 @@ impl App {
     }
 
     fn render_logs(&self, frame: &mut Frame, area: Rect) {
-        let body = pane_head(frame, area, &self.logs_title(), self.focus == Focus::Logs);
+        let body = pane_head(
+            frame,
+            area,
+            &self.logs_title(),
+            self.focus == Focus::Logs,
+            self.theme,
+        );
         let total = self.logs.len();
         let height = body.height as usize;
         let scroll = self.log_scroll.min(total);
@@ -2261,13 +2388,13 @@ impl App {
             } else {
                 "press l to follow logs for the selected device"
             };
-            lines.push(Line::styled(message, MUTED));
+            lines.push(Line::styled(message, self.theme.muted));
         } else {
             for entry in self.logs.range(from..to) {
                 lines.push(Line::from(vec![
-                    Span::styled(compact_time(&entry.time), MUTED),
+                    Span::styled(compact_time(&entry.time), self.theme.muted),
                     Span::raw(" "),
-                    Span::styled(entry.process.clone(), ACCENT),
+                    Span::styled(entry.process.clone(), self.theme.accent),
                     Span::raw(" "),
                     Span::raw(entry.message.clone()),
                 ]));
@@ -2278,13 +2405,13 @@ impl App {
 
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
         let title = format!(" activity - last {} ops", self.config.activity_capacity);
-        let body = pane_head(frame, area, &title, false);
+        let body = pane_head(frame, area, &title, false, self.theme);
         let mut lines: Vec<Line> = Vec::new();
         for line in self.activity.iter().take(body.height as usize) {
             lines.push(Line::from(vec![
-                Span::styled(line.time.clone(), MUTED),
+                Span::styled(line.time.clone(), self.theme.muted),
                 Span::raw("  "),
-                Span::styled(line.text.clone(), line.style()),
+                Span::styled(line.text.clone(), line.style(self.theme)),
             ]));
         }
         frame.render_widget(Paragraph::new(lines), body);
@@ -2303,12 +2430,12 @@ impl App {
                 let hovered = self.is_target_hovered(*target);
                 let style = if hovered {
                     if matches!(target, MouseTarget::Quit | MouseTarget::ConfirmDelete(true)) {
-                        HOVER_DANGER
+                        self.theme.hover_danger
                     } else {
-                        HOVER_BUTTON
+                        self.theme.hover_button
                     }
                 } else {
-                    ACCENT
+                    self.theme.accent
                 };
                 spans.push(Span::styled(label.clone(), style));
                 spans
@@ -2317,7 +2444,7 @@ impl App {
             InputMode::Normal => Line::from(control_spans.collect::<Vec<_>>()),
             InputMode::Edit { kind, text, .. } => {
                 let mut spans = vec![
-                    Span::styled(format!("{}: ", kind.title()), ACCENT),
+                    Span::styled(format!("{}: ", kind.title()), self.theme.accent),
                     Span::raw(text.clone()),
                     Span::raw(" "),
                 ];
@@ -2430,17 +2557,19 @@ fn compute_layout(area: Rect) -> Rects {
 
 /// Pane chrome: 2-row title bar with a bottom border, content below. Panes
 /// too short for a title just get the content.
-fn pane_head(frame: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
+fn pane_head(frame: &mut Frame, area: Rect, title: &str, focused: bool, theme: Theme) -> Rect {
     if area.height < 3 {
         return area;
     }
     let inner = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
     let head = inner[0];
     frame.render_widget(
-        Block::new().borders(Borders::BOTTOM).border_style(BORDER),
+        Block::new()
+            .borders(Borders::BOTTOM)
+            .border_style(theme.border),
         head,
     );
-    let style = if focused { ACCENT } else { MUTED };
+    let style = if focused { theme.accent } else { theme.muted };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(title.to_string(), style))),
         Rect::new(head.x, head.y, head.width, 1),
@@ -2471,7 +2600,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
     buf.set_stringn(x, y, text, width as usize, style);
 }
 
-fn render_too_small(frame: &mut Frame, area: Rect) {
+fn render_too_small(frame: &mut Frame, area: Rect, theme: Theme) {
     let message = format!(
         "terminal too small: need at least {MIN_WIDTH}x{MIN_HEIGHT}, have {}x{}",
         area.width, area.height
@@ -2487,11 +2616,18 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
             center_y.saturating_sub(1),
             message_width,
             &message,
-            WARN,
+            theme.warning,
         );
     }
     if area.width >= 10 {
-        put(buf, center_x - 5, center_y, 10, "press q to quit", MUTED);
+        put(
+            buf,
+            center_x - 5,
+            center_y,
+            10,
+            "press q to quit",
+            theme.muted,
+        );
     }
 }
 
@@ -2520,7 +2656,7 @@ const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
 ];
 
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(frame: &mut Frame, area: Rect, theme: Theme) {
     let width = 64u16.min(area.width.saturating_sub(4)).max(20);
     let height = (HELP.len() as u16 + 4)
         .min(area.height.saturating_sub(4))
@@ -2534,8 +2670,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::bordered()
-            .border_style(BORDER)
-            .title(Span::styled(" simtop help ", ACCENT)),
+            .border_style(theme.border)
+            .title(Span::styled(" simtop help ", theme.accent)),
         popup,
     );
     let inner = popup.inner(Margin {
@@ -2546,7 +2682,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .iter()
         .map(|(key, description)| {
             Line::from(vec![
-                Span::styled(format!("{key:<28}"), ACCENT),
+                Span::styled(format!("{key:<28}"), theme.accent),
                 Span::raw(*description),
             ])
         })
@@ -2558,38 +2694,46 @@ fn render_preferences(
     frame: &mut Frame,
     area: Rect,
     preferences: &DisplayPreferences,
+    theme_name: ThemeName,
     hovered_target: Option<MouseTarget>,
+    theme: Theme,
 ) {
     let popup = preferences_popup(area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::bordered()
-            .border_style(BORDER)
-            .title(Span::styled(" display preferences ", ACCENT)),
+            .border_style(theme.border)
+            .title(Span::styled(" display preferences ", theme.accent)),
         popup,
     );
     let inner = popup.inner(Margin {
         horizontal: 1,
         vertical: 1,
     });
-    let mut lines = Vec::with_capacity(DISPLAY_PREFERENCE_ORDER.len() + 2);
+    let mut lines = Vec::with_capacity(DISPLAY_PREFERENCE_ORDER.len() + ThemeName::ALL.len() + 4);
     lines.push(Line::styled(
         "Optional metadata; saved automatically",
-        LABEL,
+        theme.label,
     ));
     for preference in DISPLAY_PREFERENCE_ORDER {
         let enabled = preference.is_enabled(preferences);
         let hovered = hovered_target == Some(MouseTarget::Preference(preference));
-        let key_style = if hovered { HOVER_BUTTON } else { ACCENT };
-        let label_style = if hovered {
-            INFO.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        let key_style = if hovered {
+            theme.hover_button
         } else {
-            INFO
+            theme.accent
+        };
+        let label_style = if hovered {
+            theme
+                .info
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            theme.info
         };
         lines.push(Line::from(vec![
             Span::styled(
                 if enabled { "[x]" } else { "[ ]" },
-                if enabled { ACCENT } else { MUTED },
+                if enabled { theme.accent } else { theme.muted },
             ),
             Span::raw(" "),
             Span::styled(format!("[{}]", preference.key()), key_style),
@@ -2597,15 +2741,38 @@ fn render_preferences(
             Span::styled(preference.label(), label_style),
         ]));
     }
-    lines.push(Line::styled("u/t/r toggle · v or Esc close", LABEL));
+    lines.push(Line::styled(
+        format!("Theme: {}  (h/l or Left/Right)", theme_name),
+        theme.label,
+    ));
+    for option in ThemeName::ALL {
+        let hovered = hovered_target == Some(MouseTarget::Theme(option));
+        let selected = option == theme_name;
+        let option_style = if hovered {
+            theme.hover_button
+        } else if selected {
+            theme.accent
+        } else {
+            theme.info
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "(*)" } else { "( )" }, option_style),
+            Span::raw(" "),
+            Span::styled(option.to_string(), option_style),
+        ]));
+    }
+    lines.push(Line::styled(
+        "Enter save · Esc cancel · v/q close",
+        theme.label,
+    ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn preferences_popup(area: Rect) -> Rect {
     let width = 48u16.min(area.width.saturating_sub(4)).max(32);
-    let height = (DISPLAY_PREFERENCE_ORDER.len() as u16 + 4)
+    let height = (DISPLAY_PREFERENCE_ORDER.len() as u16 + ThemeName::ALL.len() as u16 + 5)
         .min(area.height.saturating_sub(4))
-        .max(7);
+        .max(13);
     Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -2629,13 +2796,13 @@ fn state_short(state: &DeviceState) -> &'static str {
     }
 }
 
-fn state_style(state: &DeviceState) -> Style {
+fn state_style(state: &DeviceState, theme: Theme) -> Style {
     match state {
-        DeviceState::Booted => OK,
-        DeviceState::Booting | DeviceState::ShuttingDown => WARN,
-        DeviceState::Shutdown => MUTED,
-        DeviceState::Creating => ACCENT,
-        DeviceState::Unknown(_) => ERR,
+        DeviceState::Booted => theme.success,
+        DeviceState::Booting | DeviceState::ShuttingDown => theme.warning,
+        DeviceState::Shutdown => theme.muted,
+        DeviceState::Creating => theme.accent,
+        DeviceState::Unknown(_) => theme.error,
     }
 }
 
@@ -2845,6 +3012,7 @@ mod tests {
             show_udid: true,
             show_device_type: true,
             show_runtime: true,
+            theme: ThemeName::Dark,
         };
         let wide = list_columns(107, &all_metadata);
         assert!(wide.show_udid);
@@ -2868,6 +3036,7 @@ mod tests {
             show_udid: true,
             show_device_type: true,
             show_runtime: false,
+            theme: ThemeName::Nord,
         };
 
         expected.save(&path).expect("preferences should save");
@@ -2876,6 +3045,102 @@ mod tests {
             expected
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_display_preferences_default_to_dark_theme() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simtop-display-preferences-old-{}-{timestamp}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            br#"{"show_udid":true,"show_device_type":false,"show_runtime":true}"#,
+        )
+        .expect("old preferences should save");
+        let loaded = DisplayPreferences::load(&path).expect("old preferences should load");
+        assert_eq!(loaded.theme, ThemeName::Dark);
+        assert!(loaded.show_udid);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn theme_cycle_wraps_in_both_directions() {
+        let mut app = test_app();
+        app.open_preferences();
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Dracula);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Nord);
+
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Dracula);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Dark);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Light);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Catppuccin);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Nord);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Dracula);
+    }
+
+    #[test]
+    fn esc_restores_theme_preview() {
+        let mut app = test_app();
+        app.open_preferences();
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Light);
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.theme_name, ThemeName::Dark);
+        assert!(!app.show_preferences);
+    }
+
+    #[test]
+    fn enter_saves_theme_preference() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simtop-display-preferences-save-{}-{timestamp}.json",
+            std::process::id()
+        ));
+        let mut app = test_app();
+        app.display_preferences_path = path.clone();
+        app.open_preferences();
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_preferences_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            DisplayPreferences::load(&path)
+                .expect("saved preferences should load")
+                .theme,
+            ThemeName::Light
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn keyboard_and_mouse_select_the_same_theme() {
+        let mut keyboard = test_app();
+        keyboard.open_preferences();
+        keyboard.handle_preferences_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        let mut mouse = test_app();
+        mouse.open_preferences();
+        mouse.activate_mouse_target(MouseTarget::Theme(ThemeName::Light));
+
+        assert_eq!(keyboard.theme_name, mouse.theme_name);
+        assert_eq!(
+            keyboard.display_preferences.theme,
+            mouse.display_preferences.theme
+        );
     }
     #[test]
     fn available_actions_only_lists_keyable_actions() {
@@ -2917,6 +3182,8 @@ mod tests {
             tx: mpsc::channel(1).0,
             rx: mpsc::channel(1).1,
             config: TuiConfig::default(),
+            theme_name: ThemeName::Dark,
+            theme: Theme::for_name(ThemeName::Dark),
             devices: Vec::new(),
             generation: 0,
             snapshot_time: String::new(),
@@ -2940,6 +3207,8 @@ mod tests {
             confirm_delete: None,
             display_preferences: DisplayPreferences::default(),
             display_preferences_path: PathBuf::from("."),
+            preferences_before_overlay: None,
+            theme_before_overlay: None,
             show_help: false,
             show_preferences: false,
             hit_regions: vec![
@@ -2978,6 +3247,57 @@ mod tests {
 
         app.cursor_pos = Some((5, 5));
         assert_eq!(app.hovered_target(), None);
+    }
+
+    fn test_app() -> App {
+        App {
+            backend: Arc::new(TestBackend),
+            projects: ProjectsView::new(
+                Arc::new(TestBackend),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                PathBuf::from("."),
+            ),
+            active_view: ActiveView::Simulators,
+            tx: mpsc::channel(1).0,
+            rx: mpsc::channel(1).1,
+            config: TuiConfig::default(),
+            theme_name: ThemeName::Dark,
+            theme: Theme::for_name(ThemeName::Dark),
+            devices: Vec::new(),
+            generation: 0,
+            snapshot_time: String::new(),
+            filtered: Vec::new(),
+            selected: None,
+            selected_udid: None,
+            list_scroll: 0,
+            filter: String::new(),
+            state_filter: StateFilter::All,
+            refresh_in_flight: false,
+            logs_in_flight: false,
+            last_refresh: Instant::now(),
+            last_snapshot_error: None,
+            follow_udid: None,
+            logs: VecDeque::new(),
+            log_scroll: 0,
+            logs_visible: false,
+            activity: VecDeque::new(),
+            mode: InputMode::Normal,
+            focus: Focus::List,
+            confirm_delete: None,
+            display_preferences: DisplayPreferences::default(),
+            display_preferences_path: PathBuf::from("."),
+            preferences_before_overlay: None,
+            theme_before_overlay: None,
+            show_help: false,
+            show_preferences: false,
+            hit_regions: Vec::new(),
+            last_area: Rect::default(),
+            cursor_pos: None,
+            dirty: false,
+            quit: false,
+        }
     }
 
     fn test_device(state: DeviceState) -> SimDevice {
