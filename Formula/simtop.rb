@@ -5,8 +5,8 @@
 class Simtop < Formula
   desc "High-performance iOS Simulator management TUI and automation CLI"
   homepage "https://github.com/noahlin34/simtop"
-  url "https://github.com/noahlin34/simtop/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "3ba85858f644f3e1b603c36f729a65e1b9f7a594ea567b3a2c026abcbf61dbc2"
+  url "https://github.com/noahlin34/simtop/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "76877cb4db0cdf7713e76223211945831abd0c73b9c2db1dd51ad1de6bbbfda6"
   license "MIT"
 
   depends_on "rust" => :build
