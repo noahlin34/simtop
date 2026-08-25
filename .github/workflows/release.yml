@@ -185,8 +185,8 @@ jobs:
           )
 
           text, url_count = re.subn(
-              r'^  url "https://github\\.com/[^"]+/archive/refs/tags/'
-              r'v[^"]+\\.tar\\.gz"$',
+              r'^  url "https://github\.com/[^"]+/archive/refs/tags/'
+              r'v[^"]+\.tar\.gz"$',
               f'  url "{source_url}"',
               text,
               count=1,
@@ -292,8 +292,8 @@ jobs:
           )
 
           text, url_count = re.subn(
-              r'^  url "https://github\\.com/[^"]+/archive/refs/tags/'
-              r'v[^"]+\\.tar\\.gz"$',
+              r'^  url "https://github\.com/[^"]+/archive/refs/tags/'
+              r'v[^"]+\.tar\.gz"$',
               f'  url "{source_url}"',
               text,
               count=1,
