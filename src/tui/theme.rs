@@ -12,10 +12,11 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
 /// A named TUI palette.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeName {
     /// Dark slate palette used by default.
+    #[default]
     Dark,
     /// Light palette for bright terminal backgrounds.
     Light,
@@ -46,12 +47,6 @@ impl ThemeName {
             Self::Nord => "nord",
             Self::Dracula => "dracula",
         }
-    }
-}
-
-impl Default for ThemeName {
-    fn default() -> Self {
-        Self::Dark
     }
 }
 
