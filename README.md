@@ -53,28 +53,88 @@ Illustrative mock — run `simtop` for the real thing.
 
 ## Installation
 
-simtop has no published releases yet; build from source:
+### Homebrew (recommended)
+
+Install the latest published version from [Noah's Homebrew tap](https://github.com/noahlin34/homebrew-tap):
 
 ```bash
-git clone https://github.com/noahlin34/simtop.git && cd simtop
+brew tap noahlin34/tap
+brew install simtop
+```
+
+After installation, verify that the command is available:
+
+```bash
+simtop --version
+```
+
+To upgrade later:
+
+```bash
+brew update
+brew upgrade simtop
+```
+
+simtop still requires macOS 15 or later and Xcode 16, including the
+CoreSimulator tools and Simulator.app.
+
+### Build from source
+
+Building from source is useful for development or trying unreleased changes:
+
+```bash
+git clone https://github.com/noahlin34/simtop.git
+cd simtop
 cargo install --path .
 ```
 
-Tagged releases (`v*`) build a universal arm64 + x86_64 binary and draft a
-GitHub Release with the archive and checksum. A Homebrew formula ships in
-`Formula/` and activates at the first release.
+Rust 1.74 or newer is required only when building from source. Tagged releases
+also produce universal arm64 + x86_64 archives on GitHub.
 
 ## Quick start
 
+Start the interactive interface:
+
 ```bash
-simtop                            # interactive TUI
-simtop list                       # one-shot table of all devices
-simtop list --json                # machine-readable snapshot
-simtop boot "iPhone 16 Pro"       # address devices by unique name
-simtop app launch 4A2F…9B com.example.MyApp
-simtop app logs "iPhone 16 Pro" --follow
-simtop screenshot 4A2F…9B --output screen.png
+simtop
 ```
+
+Or use one-shot commands from a script or terminal:
+
+```bash
+simtop list                              # show every simulator
+simtop boot "iPhone 16 Pro"              # boot by unique name
+simtop open "iPhone 16 Pro"              # focus it in Simulator.app
+simtop screenshot "iPhone 16 Pro" --output screen.png
+simtop list --json                       # machine-readable output
+simtop app install "iPhone 16 Pro" ./MyApp.app
+simtop app launch "iPhone 16 Pro" com.example.MyApp
+```
+
+Run `simtop --help` or `simtop <command> --help` for the complete option list.
+
+### TUI controls
+
+The TUI is designed for both keyboard and mouse users. Click tabs, simulator
+rows, and action buttons; use the mouse wheel to scroll lists and logs.
+
+| Key | Action |
+|---|---|
+| `1` / `2` | Switch between Simulators and Projects |
+| `↑` / `↓` or `j` / `k` | Move through the selected list |
+| `Enter` | Perform the primary action for the selected item |
+| `b` / `s` / `o` | Boot, shut down, or open the selected simulator |
+| `p` | Save a screenshot |
+| `l` | Toggle device logs |
+| `/` | Search simulators |
+| `f` | Cycle the state filter |
+| `r` | Refresh |
+| `v` | Display preferences and theme |
+| `?` | Open help |
+| `q` or `Ctrl-C` | Quit |
+
+The Projects tab adds project discovery and Xcode build/run controls without
+leaving the TUI.
 
 ## Command reference
 
@@ -87,7 +147,7 @@ simtop screenshot 4A2F…9B --output screen.png
 | `simtop shutdown <selector>` | Shut a device down (idempotent) |
 | `simtop open <selector>` | Open Simulator.app focused on the device |
 | `simtop create --name N --device-type ID --runtime ID` | Create a device from CoreSimulator identifiers |
-| `simtop delete <selector>` | Delete a device (confirms interactively; never with `--json`/`--no-input`) |
+| `simtop delete <selector>` | Delete a simulator (confirms interactively unless `--json` or `--no-input` is used) |
 | `simtop screenshot <selector> [--output PATH]` | Capture a PNG of the device screen |
 | `simtop app install <selector> <path.app>` | Install an app bundle |
 | `simtop app launch <selector> <bundle-id>` | Launch an installed app |
@@ -155,6 +215,31 @@ so scripts can branch on failures without parsing messages.
 | 12 | Parse error |
 | 70 | Internal error |
 
+## Troubleshooting
+
+If simtop cannot find Xcode, check the selected developer directory:
+
+```bash
+xcode-select -p
+```
+
+Select Xcode explicitly when more than one installation is present:
+
+```bash
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+```
+
+For a one-off override, use either the environment variable or the global
+flag:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer simtop
+simtop --developer-dir /Applications/Xcode-beta.app list
+```
+
+Make sure the required simulator runtime is installed in Xcode before trying
+to boot or create a device.
+
 ## Architecture
 
 `src/main.rs` is a thin shim; all logic lives in the `simtop` library crate.
@@ -172,8 +257,7 @@ flowchart LR
 ```
 
 - `src/backend/` — the trait, the hybrid policy, and the typed `simctl` client
-- `src/native.rs` + `native/` — C ABI wrapper and the Objective-C CoreSimulator bridge
-- `src/tui.rs` — the TUI state machine and rendering
+- `src/tui/` — the TUI state machine and rendering
 - `src/cli.rs` — clap CLI, dispatch, selector resolution
 - `src/model.rs` — schema-v1 domain types; the JSON wire format is a tested contract
 - `src/error.rs` — error taxonomy with stable machine codes and exit codes
