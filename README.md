@@ -7,24 +7,10 @@ backend: a native Objective-C CoreSimulator bridge for the hot paths, with
 `simctl` as the fallback. Manage simulators with first-class keyboard and
 mouse controls, or drive them from scripts and CI.
 
-```
-┌ simtop ───────────────────────────── gen 12 | 3 devices | refresh 2s ──┐
-│ STATE          NAME                                                    │
-│ booted         iPhone 16 Pro                                           │
-│ shutdown       iPhone SE (3rd)                                         │
-│ booting        iPad Pro 11                                             │
-├────────────────────────────────────────────────────────────────────────┤
-│ details: iPhone 16 Pro                                                 │
-│   name  iPhone 16 Pro                                                   │
-│   state booted                                                         │
-│   os 18.0                                                               │
-│   available yes                                                         │
-│   actions: [s] shutdown  [o] open Simulator.app  [p] screenshot  [l] … │
-└────────────────────────────────────────────────────────────────────────┘
-[↑/↓] select  [Enter] boot/open  [b] boot  [s] shutdown  [/] search  [v] display  [?] help  [q] quit
-```
 
-Illustrative mock — run `simtop` for the real thing.
+https://github.com/user-attachments/assets/e8679b5e-f384-4586-9e63-42fb49bf5ef6
+
+
 
 ## Features
 
